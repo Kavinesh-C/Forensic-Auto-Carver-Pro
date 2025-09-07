@@ -380,7 +380,6 @@ def format_hex_view(data_bytes, start_offset=0):
 
 def attempt_decryption(filepath, encryption_type, password=None):
     """Master decryption function that handles password and passwordless attempts."""
-    global decryption_status, uploaded_files_db
     filename = os.path.basename(filepath)
     decryption_status.update({"in_progress": True, "complete": False, "message": "Starting decryption..."})
     if filename in uploaded_files_db: uploaded_files_db[filename]['encryption_status']['decrypting'] = True
@@ -444,7 +443,6 @@ def crack_openssl_aes_with_passwords(filepath, output_path, passwords_to_try, is
 # --- PERFORMANCE OPTIMIZATION using mmap ---
 def simple_file_carver(filepath, selected_types):
     """File carving engine optimized with mmap for speed and memory efficiency."""
-    global carving_status, carved_files_db
     carving_status = {"progress": 0, "current_offset": "0x00000000", "files_found": 0, "complete": False, "found_files_list": []}
     carved_files_db.clear()
     found_file_counter = 0
@@ -522,7 +520,6 @@ def simple_file_carver(filepath, selected_types):
 
 def scan_for_deleted_files_engine(filepath):
     """Scans a disk image for deleted files using pytsk3 and updates global state."""
-    global deleted_files_db, deleted_scan_status
     deleted_scan_status.update({"in_progress": True, "complete": False, "files_found": 0, "message": "Starting scan..."})
     found_files = {}
     try:
@@ -1448,7 +1445,6 @@ def index():
 
 @app.route('/evidence_upload', methods=['GET', 'POST'])
 def evidence_upload():
-    global uploaded_files_db
     modal_payload = {"show_encryption_modal": False}
     if request.method == 'POST' and 'file' in request.files and request.files['file'].filename != '':
         file = request.files['file']
