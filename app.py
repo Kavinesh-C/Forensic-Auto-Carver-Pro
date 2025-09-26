@@ -1349,7 +1349,7 @@ def _validate_and_extract_file(mm, file_start_pos, sig_options, seen_hashes, fil
 # --- NEW, CORRECTED CARVER ---
 def simple_file_carver(filepath, selected_types):
     """High-speed carver that eliminates empty files and duplicates."""
-    global carving_status
+    #global carving_status
     
     # Initialize status
     carving_status.update({
@@ -1502,7 +1502,7 @@ def save_carved_file(file_data, found_pos, name, sig, file_counter, output_dir):
 
 def update_carving_status(file_counter, found_pos, file_data, file_size, name):
     """Update the global carving status."""
-    global carving_status
+    #global carving_status
     offset_hex = f"{found_pos:08X}"
     
     file_info = {
@@ -1601,7 +1601,7 @@ def _scan_partition_worker(args):
 
 def recover_deleted_files_engine(filepath):
     """Advanced deleted files recovery with multiple scanning methods like Autopsy."""
-    global deleted_scan_status
+    # global deleted_scan_status
     
     # Initialize global status if not exists
     if 'deleted_scan_status' not in globals():
@@ -4311,7 +4311,7 @@ def get_active_evidence_path():
 
 def _clear_all_session_data():
     """Clears all in-memory data and temporary result files."""
-    global carving_status, deleted_scan_status, decryption_status, hashing_status, strings_status, uploaded_files_db, deleted_files_db, sorted_deleted_inodes
+    # global carving_status, deleted_scan_status, decryption_status, hashing_status, strings_status, uploaded_files_db, deleted_files_db, sorted_deleted_inodes
     
     uploaded_files_db.clear()
     deleted_files_db.clear()
@@ -4500,7 +4500,7 @@ def determine_recovery_method(filename):
 # --- STRICT AUTOMATIC DELETED FILES RECOVERY ---
 def strict_deleted_files_recovery_engine(filepath):
     """Autopsy-like automatic deleted files recovery with strict validation."""
-    global deleted_scan_status
+    # global deleted_scan_status
     
     deleted_scan_status.update({
         "in_progress": True, 
@@ -5741,7 +5741,7 @@ def run_auto_carving():
     """
     Handles the file carving process based on user-selected file types.
     """
-    global carving_status, carved_files_db, sorted_carved_keys
+    # global carving_status, carved_files_db, sorted_carved_keys
 
     image_path = get_active_evidence_path()
     if not image_path:
@@ -5795,7 +5795,7 @@ def clear_session():
 
 @app.route('/perform_manual_carve', methods=['POST'])
 def perform_manual_carve():
-    global sorted_carved_keys
+    # global sorted_carved_keys
     filepath = get_active_evidence_path()
     if not filepath:
         flash("No evidence file is loaded.", "error")
