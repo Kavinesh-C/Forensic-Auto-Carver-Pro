@@ -4311,7 +4311,8 @@ def get_active_evidence_path():
 
 def _clear_all_session_data():
     """Clears all in-memory data and temporary result files."""
-    # global carving_status, deleted_scan_status, decryption_status, hashing_status, strings_status, uploaded_files_db, deleted_files_db, sorted_deleted_inodes
+    # global , deleted_scan_status, decryption_status, hashing_status, strings_status, uploaded_files_db, deleted_files_db, sorted_deleted_inodes
+    carving_status,
     
     uploaded_files_db.clear()
     deleted_files_db.clear()
