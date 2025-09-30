@@ -1524,7 +1524,7 @@ def _validate_and_extract_file(mm, file_start_pos, sig_options, seen_hashes, fil
 # --- NEW, CORRECTED CARVER ---
 def simple_file_carver(filepath, selected_types):
     """High-speed carver that eliminates empty files and duplicates."""
-    global carving_status
+    # global carving_status
     
     # Initialize status
     carving_status.update({
@@ -1677,7 +1677,7 @@ def save_carved_file(file_data, found_pos, name, sig, file_counter, output_dir):
 
 def update_carving_status(file_counter, found_pos, file_data, file_size, name):
     """Update the global carving status."""
-    global carving_status
+    # global carving_status
     offset_hex = f"{found_pos:08X}"
     
     file_info = {
@@ -1942,7 +1942,7 @@ def recover_deleted_files_engine(filepath):
             return None, written
 
     def process_deleted_file(fs_object, recovery_method, fs_offset=0):
-        nonlocal total_recovered
+        # nonlocal total_recovered
         try:
             meta = getattr(fs_object.info, 'meta', None)
             if not meta or not hasattr(meta, 'size'):
@@ -5657,7 +5657,7 @@ def get_active_evidence_path():
 
 def _clear_all_session_data():
     """Clears all in-memory data and temporary result files."""
-    global carving_status , deleted_scan_status, decryption_status, hashing_status, strings_status, uploaded_files_db, deleted_files_db, sorted_deleted_inodes
+    global carving_status , deleted_scan_status, decryption_status, hashing_status, strings_status, sorted_deleted_inodes
     
     
     uploaded_files_db.clear()
@@ -5878,7 +5878,7 @@ def determine_recovery_method(filename):
 # --- STRICT AUTOMATIC DELETED FILES RECOVERY ---
 def strict_deleted_files_recovery_engine(filepath):
     """Autopsy-like automatic deleted files recovery with strict validation."""
-    global deleted_scan_status
+    # global deleted_scan_status
     
     deleted_scan_status.update({
         "in_progress": True, 
@@ -5926,8 +5926,8 @@ def strict_deleted_files_recovery_engine(filepath):
     
     def validate_and_save_file(content, original_name, recovery_method, fs_object=None):
         """STRICT validation: Check file size, content, and duplicates before saving."""
-        nonlocal total_recovered, seen_hashes
-        global deleted_files_db
+       # nonlocal total_recovered, seen_hashes
+        # global deleted_files_db
         
         deleted_scan_status["validation_stats"]["total_scanned"] += 1
         
@@ -6492,7 +6492,7 @@ def start_deleted_recovery():
 @app.route('/evidence_upload', methods=['GET', 'POST'])
 def evidence_upload():
     """Handle evidence file upload with progress tracking."""
-    global uploaded_files_db, upload_status
+    # global uploaded_files_db, upload_status
     
     if request.method == 'POST':
         # This route should only handle AJAX uploads, but keep for fallback
@@ -6517,7 +6517,7 @@ def evidence_upload():
 @app.route('/ajax_upload', methods=['POST'])
 def ajax_upload():
     """Handle AJAX file upload with progress tracking."""
-    global uploaded_files_db, upload_status
+    # global uploaded_files_db, upload_status
     
     if 'file' not in request.files:
         return jsonify({'error': 'No file selected'}), 400
@@ -6650,7 +6650,7 @@ def ajax_upload():
         return jsonify({'error': f'Error uploading file: {str(e)}'}), 500
 def _process_uploaded_file(filename, filepath):
     """Process uploaded file and add to database."""
-    global uploaded_files_db
+    # global uploaded_files_db
 
     file_size = os.path.getsize(filepath)
     encryption_info = detect_encryption(filepath)
@@ -6703,7 +6703,7 @@ def _process_uploaded_file(filename, filepath):
 
 def update_upload_progress(bytes_uploaded=None, total_bytes=None):
     """Update upload progress in real-time."""
-    global upload_status
+    # global upload_status
     
     current_time = time.time()
     
@@ -7865,7 +7865,7 @@ def run_auto_carving():
     """
     Handles the file carving process based on user-selected file types.
     """
-    global carving_status, carved_files_db, sorted_carved_keys
+   #  global carving_status, carved_files_db, sorted_carved_keys
 
     image_path = get_active_evidence_path()
     if not image_path:
@@ -7919,7 +7919,7 @@ def clear_session():
 
 @app.route('/perform_manual_carve', methods=['POST'])
 def perform_manual_carve():
-    global sorted_carved_keys
+    # global sorted_carved_keys
     filepath = get_active_evidence_path()
     if not filepath:
         flash("No evidence file is loaded.", "error")
