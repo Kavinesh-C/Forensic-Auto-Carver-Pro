@@ -86,7 +86,21 @@ except ImportError:
 # --- Application Setup ---
 app = Flask(__name__)
 app.secret_key = 'supersecretkey'
+app.config['MAX_CONTENT_LENGTH'] = None  # No limit on request body size
+
+# Increase other limits for large file handling
+app.config['MAX_COOKIE_SIZE'] = 10 * 1024 * 1024  # 
 APP_ROOT = os.path.dirname(os.path.abspath(__file__))
+
+# Write a small sentinel file at import time so we can verify which file the WSGI process loaded.
+try:
+    _loaded_path = os.path.join(APP_ROOT, 'app_loaded.log')
+    with open(_loaded_path, 'a', encoding='utf-8') as _lf:
+        _lf.write('\n' + '='*80 + '\n')
+        _lf.write(f'App module imported from: {os.path.abspath(__file__)}\n')
+        _lf.write(f'Import time: {repr(__import__("datetime").datetime.now())}\n')
+except Exception:
+    pass
 
 # --- MODIFIED: Paths set to be inside the main project folder ---
 UPLOAD_FOLDER = os.path.join(APP_ROOT, 'uploads')
@@ -107,7 +121,7 @@ app.config['DICTIONARY_FILE'] = DICTIONARY_FILE
 app.config['DELETED_RECOVERY_FOLDER'] = DELETED_RECOVERY_FOLDER
 
 # --- Database Configuration ---
-DB_STORAGE_LIMIT_GB = 20
+DB_STORAGE_LIMIT_GB = 50
 DB_STORAGE_LIMIT_BYTES = DB_STORAGE_LIMIT_GB * 1024 * 1024 * 1024
 
 if SQLAlchemy and psycopg2:
@@ -124,6 +138,88 @@ os.makedirs(app.config['DECRYPTED_FOLDER'], exist_ok=True)
 os.makedirs(app.config['ENCRYPTED_FOLDER'], exist_ok=True)
 os.makedirs(app.config['DELETED_RECOVERY_FOLDER'], exist_ok=True)
 
+# --- Populate in-memory deleted_files_db from on-disk files at startup ---
+def populate_deleted_files_db_from_disk():
+    """Scan the deleted recovery folder and populate the in-memory `deleted_files_db`.
+
+    This helps the web UI show files that were recovered on disk before the server started.
+    """
+    global deleted_files_db
+    try:
+        deleted_files_db.clear()
+    except Exception:
+        deleted_files_db = {}
+
+    recovery_dir = app.config.get('DELETED_RECOVERY_FOLDER', os.path.join(APP_ROOT, 'deleted_files'))
+    try:
+        for fname in sorted(os.listdir(recovery_dir)):
+            fpath = os.path.join(recovery_dir, fname)
+            if not os.path.isfile(fpath):
+                continue
+            try:
+                info = get_enhanced_file_info(fpath)
+            except Exception:
+                info = {'mime_type': 'application/octet-stream', 'file_type': 'Unknown', 'thumbnail': None, 'size_bytes': os.path.getsize(fpath) if os.path.exists(fpath) else 0, 'size_kb': '0'}
+
+            try:
+                mtime = datetime.datetime.fromtimestamp(os.path.getmtime(fpath)).strftime('%Y-%m-%d %H:%M:%S')
+            except Exception:
+                mtime = 'Unknown'
+
+            try:
+                ctime = datetime.datetime.fromtimestamp(os.path.getctime(fpath)).strftime('%Y-%m-%d %H:%M:%S')
+            except Exception:
+                ctime = 'Unknown'
+
+            deleted_files_db[os.path.basename(fpath)] = {
+                'inode': None,
+                'name': os.path.basename(fpath),
+                'size': info.get('size_bytes', 0),
+                'size_kb': info.get('size_kb', '0'),
+                'mtime': mtime,
+                'ctime': ctime,
+                'file_type': info.get('mime_type', 'application/octet-stream'),
+                'thumbnail': info.get('thumbnail'),
+                'path': fpath
+            }
+    except Exception as e:
+        app.logger.debug(f"populate_deleted_files_db_from_disk: error scanning folder: {e}")
+
+# Run initial population so the UI sees recovered files already on disk
+try:
+    populate_deleted_files_db_from_disk()
+except Exception:
+    pass
+
+def get_encrypted_files():
+    """Get list of encrypted files with their sizes."""
+    encrypted_files = []
+    try:
+        for filename in os.listdir(app.config['ENCRYPTED_FOLDER']):
+            if filename.endswith('.enc'):
+                filepath = os.path.join(app.config['ENCRYPTED_FOLDER'], filename)
+                if os.path.isfile(filepath):
+                    size = os.path.getsize(filepath)
+                    size_str = format_bytes(size)
+                    encrypted_files.append({
+                        'filename': filename,
+                        'size': size_str,
+                        'path': filepath
+                    })
+    except Exception as e:
+        print(f"Error listing encrypted files: {e}")
+    
+    return encrypted_files
+
+@app.route('/rescan_deleted_files', methods=['GET', 'POST'])
+def rescan_deleted_files():
+    """HTTP endpoint to trigger a rescanning of the deleted recovery folder and populate the in-memory DB."""
+    try:
+        populate_deleted_files_db_from_disk()
+        return jsonify({'success': True, 'files': len(deleted_files_db), 'message': 'Rescan complete.'})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
 if not os.path.exists(DICTIONARY_FILE):
     with open(DICTIONARY_FILE, 'w') as f:
         f.write("password\n123456\nadmin\n12345\n12345678\nletmein\nqwerty\npassword1\n")
@@ -136,6 +232,57 @@ if db:
         filepath = db.Column(db.String(512), nullable=False, unique=True)
         filesize = db.Column(db.BigInteger, nullable=False)
         upload_date = db.Column(db.DateTime, default=datetime.datetime.utcnow)
+        upload_in_progress = db.Column(db.Boolean, default=False)
+
+        def __repr__(self):
+            return f'<EvidenceFile {self.filename}>'
+
+    class EvidenceFileChunk(db.Model):
+        __tablename__ = 'evidence_file_chunk'
+        id = db.Column(db.Integer, primary_key=True)
+        evidence_id = db.Column(db.Integer, db.ForeignKey('evidence_file.id', ondelete='CASCADE'), nullable=False)
+        chunk_index = db.Column(db.Integer, nullable=False)
+        data = db.Column(db.LargeBinary, nullable=False)
+
+        evidence = db.relationship('EvidenceFile', backref=db.backref('chunks', cascade='all, delete-orphan'))
+
+    # create tables if they don't exist
+    try:
+        db.create_all()
+    except Exception:
+        # Ignore DB creation errors at startup (user may not have DB perms)
+        pass
+
+    # Ensure schema changes for existing installations (add new columns / tables)
+    try:
+        from sqlalchemy import inspect, text
+        # Run schema fixes inside the Flask application context so the
+        # engine/session are available and permissioned properly.
+        with app.app_context():
+            inspector = inspect(db.engine)
+
+            # Add missing upload_in_progress column if it doesn't exist
+            cols = inspector.get_columns('evidence_file') if inspector.has_table('evidence_file') else []
+            col_names = [c['name'] for c in cols]
+            if 'upload_in_progress' not in col_names:
+                try:
+                    db.session.execute(text('ALTER TABLE evidence_file ADD COLUMN upload_in_progress boolean DEFAULT false'))
+                    db.session.commit()
+                except Exception:
+                    try:
+                        db.session.rollback()
+                    except Exception:
+                        pass
+
+            # Ensure chunk table exists
+            if not inspector.has_table('evidence_file_chunk'):
+                try:
+                    EvidenceFileChunk.__table__.create(bind=db.engine, checkfirst=True)
+                except Exception:
+                    pass
+    except Exception:
+        # If inspection fails, continue without blocking startup
+        pass
 
         def __repr__(self):
             return f'<EvidenceFile {self.filename}>'
@@ -173,7 +320,6 @@ deleted_scan_status = {
     }
 }
 
-# Add upload timing
 upload_status = {
     "in_progress": False,
     "progress": 0,
@@ -181,9 +327,14 @@ upload_status = {
     "start_time": None,
     "estimated_total_time": None,
     "elapsed_time": "0s",
-    "time_remaining_str": "N/A"
+    "time_remaining_str": "N/A",
+    "total_bytes": 0,
+    "bytes_uploaded": 0,
+    "upload_speed": 0,
+    "last_update_time": None,
+    "complete": False,
+    "error": None
 }
-
 # --- Status Dictionaries for Background Tasks ---
 
 decryption_status = {
@@ -330,6 +481,19 @@ def calculate_time_estimations(status_dict, current_progress, total_items=None):
         status_dict["time_remaining_str"] = "Calculating..."
     
     return status_dict["time_remaining_str"]
+
+def format_bytes(size_bytes):
+    """Convert bytes to human-readable format"""
+    if size_bytes == 0:
+        return "0 B"
+    
+    size_names = ["B", "KB", "MB", "GB", "TB"]
+    i = 0
+    while size_bytes >= 1024 and i < len(size_names) - 1:
+        size_bytes /= 1024.0
+        i += 1
+    
+    return f"{size_bytes:.2f} {size_names[i]}"
 
 def calculate_upload_time_estimations(bytes_uploaded, total_bytes, start_time):
     """Calculate upload time estimations."""
@@ -491,6 +655,17 @@ def get_enhanced_file_info(filepath):
             'size_bytes': 0,
             'size_kb': '0'
         }
+
+def generate_deleted_filename(seq, detected_ext=''):
+    """Generate a standardized deleted-file recovery filename.
+
+    Format: deleted_files_recovery_0001[.ext]
+    """
+    ext = detected_ext or ''
+    # ensure extension starts with a dot
+    if ext and not ext.startswith('.'):
+        ext = f'.{ext.lstrip(".")}'
+    return f"deleted_files_recovery_{seq:04d}{ext}"
     
 def get_active_evidence_path():
     if not uploaded_files_db: 
@@ -1349,7 +1524,7 @@ def _validate_and_extract_file(mm, file_start_pos, sig_options, seen_hashes, fil
 # --- NEW, CORRECTED CARVER ---
 def simple_file_carver(filepath, selected_types):
     """High-speed carver that eliminates empty files and duplicates."""
-    #global carving_status
+    global carving_status
     
     # Initialize status
     carving_status.update({
@@ -1502,7 +1677,7 @@ def save_carved_file(file_data, found_pos, name, sig, file_counter, output_dir):
 
 def update_carving_status(file_counter, found_pos, file_data, file_size, name):
     """Update the global carving status."""
-    #global carving_status
+    global carving_status
     offset_hex = f"{found_pos:08X}"
     
     file_info = {
@@ -1511,12 +1686,45 @@ def update_carving_status(file_counter, found_pos, file_data, file_size, name):
         "hex_preview": format_hex_view(file_data[:256])
     }
     
+    # Update basic counters
     carving_status.update({
         "files_found": file_counter,
         "current_offset": f"0x{offset_hex}",
         "progress": int((found_pos / file_size) * 100) if file_size > 0 else 0
     })
     carving_status["found_files_list"].append(file_info)
+
+    # Update bytes processed (use found_pos + file size as an approximation)
+    try:
+        processed = found_pos + len(file_data)
+        # keep the maximum processed value to avoid regressions
+        carving_status['bytes_processed'] = max(carving_status.get('bytes_processed', 0), processed)
+    except Exception:
+        pass
+
+    # Calculate elapsed, speed, and ETA if start_time and total_bytes are available
+    try:
+        if carving_status.get('start_time'):
+            now = time.time()
+            elapsed = now - carving_status['start_time']
+            carving_status['elapsed_time'] = format_time(elapsed)
+
+            bytes_done = carving_status.get('bytes_processed', 0)
+            total = carving_status.get('total_bytes') or file_size or 0
+
+            if bytes_done > 0 and elapsed > 0 and total > 0:
+                speed = bytes_done / elapsed
+                estimated_total_seconds = total / max(speed, 0.0001)
+                remaining_seconds = max(0, estimated_total_seconds - elapsed)
+                carving_status['estimated_total_time'] = format_time(estimated_total_seconds)
+                carving_status['time_remaining_str'] = format_time(remaining_seconds)
+            else:
+                # fallback placeholders
+                carving_status['estimated_total_time'] = None
+                carving_status['time_remaining_str'] = 'Calculating...'
+    except Exception:
+        # Don't let timing errors break the carving loop
+        pass
 
 def _scan_partition_worker(args):
     """Worker function for parallel partition scanning with deep scan and deduplication."""
@@ -1600,113 +1808,345 @@ def _scan_partition_worker(args):
 # --- Find and REPLACE your 'scan_for_deleted_files_engine' function with this new version ---
 
 def recover_deleted_files_engine(filepath):
-    """Advanced deleted files recovery with multiple scanning methods like Autopsy."""
-    # global deleted_scan_status
-    
-    # Initialize global status if not exists
-    if 'deleted_scan_status' not in globals():
+    """Improved deleted files recovery engine optimized for large images.
+
+    Features:
+    - Streams reads/writes to avoid loading large files into memory.
+    - Two-step deduplication (quick head/tail signature + full SHA256) to avoid duplicates.
+    - Skips empty/small files and provides periodic status updates via deleted_scan_status.
+    - Writes to a temporary file and atomically moves to final filename when complete.
+    """
+    global deleted_scan_status, deleted_files_db
+
+    # Initialize globals if missing
+    if 'deleted_scan_status' not in globals() or not isinstance(deleted_scan_status, dict):
         deleted_scan_status = {}
+    if 'deleted_files_db' not in globals() or not isinstance(deleted_files_db, dict):
+        deleted_files_db = {}
     
+    # Reset for fresh run
+    deleted_files_db.clear()
+
     deleted_scan_status.update({
-        "in_progress": True, 
-        "complete": False, 
-        "files_found": 0, 
-        "message": "Starting advanced deleted files recovery...",
+        "in_progress": True,
+        "complete": False,
+        "files_found": 0,
+        "message": "Starting deleted files recovery...",
+        "start_time": time.time(),
+        "last_update_time": time.time(),
+        "elapsed_time": "0s",
+        "estimated_total_time": None,
+        "time_remaining_str": "Calculating...",
         "scan_methods": {
             "directory_walk": 0,
             "inode_scan": 0,
             "file_slack": 0,
             "unallocated_space": 0,
             "recycle_bin": 0
+        },
+        "validation_stats": {
+            "total_scanned": 0,
+            "empty_rejected": 0,
+            "duplicate_rejected": 0,
+            "invalid_rejected": 0,
+            "valid_recovered": 0
         }
     })
 
-    recovery_dir = app.config['DELETED_RECOVERY_FOLDER']
+    recovery_dir = app.config.get('DELETED_RECOVERY_FOLDER', os.path.join(APP_ROOT, 'deleted_files'))
+    os.makedirs(recovery_dir, exist_ok=True)
+
+    # Deduplication sets
+    seen_quick = set()   # (size, head_hash, tail_hash)
+    seen_full = set()    # sha256 full content
+    # Backwards-compatible quick md5 set used by remaining legacy slack logic
     seen_hashes = set()
+
     MIN_FILE_SIZE = 128
-    
-    # Initialize database for storing file info
-    deleted_files_db = {}
-    
-    # Clear previous results
+    CHUNK_SIZE = 4 * 1024 * 1024  # 4MB streaming
+
+    # Clear previous results in recovery_dir (only files created by previous runs)
     try:
         for item in os.listdir(recovery_dir):
             item_path = os.path.join(recovery_dir, item)
-            if os.path.isfile(item_path):
-                os.unlink(item_path)
+            if os.path.isfile(item_path) and item.startswith('deleted_'):
+                try:
+                    os.unlink(item_path)
+                except Exception:
+                    continue
     except Exception as e:
-        deleted_scan_status["message"] = f"Error clearing old files: {e}"
-        deleted_scan_status["in_progress"] = False
-        return
+        deleted_scan_status.update({"message": f"Error clearing old files: {e}", "in_progress": False})
+        return {}
 
     total_recovered = 0
-    
-    # Status update function
+
     def update_status(method, count=1):
         nonlocal total_recovered
         total_recovered += count
         deleted_scan_status["files_found"] = total_recovered
-        deleted_scan_status["scan_methods"][method] += count
+        deleted_scan_status["scan_methods"][method] = deleted_scan_status["scan_methods"].get(method, 0) + count
         deleted_scan_status["message"] = f"Recovered {total_recovered} files... ({method})"
+        # Update validation stats for recovered files
+        try:
+            v = deleted_scan_status.setdefault('validation_stats', {
+                'total_scanned': 0, 'empty_rejected': 0, 'duplicate_rejected': 0, 'invalid_rejected': 0, 'valid_recovered': 0
+            })
+            v['valid_recovered'] = v.get('valid_recovered', 0) + count
+        except Exception:
+            pass
+
+        # Update timing estimations periodically
+        try:
+            calculate_time_estimations(deleted_scan_status, deleted_scan_status.get('validation_stats', {}).get('total_scanned', 0))
+        except Exception:
+            pass
+
+    def _compute_quick_hash(fs_file, size):
+        """Compute a fast head+tail md5 signature for quick dedupe checks."""
+        try:
+            head_len = min(8192, size)
+            head = fs_file.read_random(0, head_len) or b''
+            tail_len = 8192
+            if size > head_len:
+                tail_offset = max(0, size - tail_len)
+                tail = fs_file.read_random(tail_offset, min(tail_len, size - tail_offset)) or b''
+            else:
+                tail = b''
+            h = hashlib.md5()
+            h.update(head)
+            h.update(tail)
+            return h.hexdigest(), head, tail
+        except Exception:
+            return None, b'', b''
+
+    def _compute_full_hash_and_write(fs_file, size, tmp_path):
+        """Stream file out to tmp_path while computing SHA256.
+        Returns sha256 hex digest and final size written.
+        """
+        sha = hashlib.sha256()
+        written = 0
+        try:
+            offset = 0
+            while offset < size:
+                to_read = min(CHUNK_SIZE, size - offset)
+                chunk = fs_file.read_random(offset, to_read)
+                if not chunk:
+                    break
+                tmp_path.write(chunk)
+                sha.update(chunk)
+                written += len(chunk)
+                offset += len(chunk)
+            tmp_path.flush()
+            return sha.hexdigest(), written
+        except Exception:
+            return None, written
 
     def process_deleted_file(fs_object, recovery_method, fs_offset=0):
+        nonlocal total_recovered
         try:
-            if not fs_object.info or not fs_object.info.meta or fs_object.info.meta.size <= 0:
+            meta = getattr(fs_object.info, 'meta', None)
+            if not meta or not hasattr(meta, 'size'):
+                return
+            size = int(meta.size)
+            if size <= MIN_FILE_SIZE:
+                # count as scanned but rejected for being too small
+                try:
+                    deleted_scan_status.setdefault('validation_stats', {}).setdefault('total_scanned', 0)
+                    deleted_scan_status['validation_stats']['total_scanned'] += 1
+                    deleted_scan_status['validation_stats']['empty_rejected'] = deleted_scan_status['validation_stats'].get('empty_rejected', 0) + 1
+                except Exception:
+                    pass
                 return
 
-            # Get offset information if available
-            file_offset = "Unknown"
-            if hasattr(fs_object.info.meta, 'addr'):
-                file_offset = f"0x{fs_object.info.meta.addr:08X}"
-            
-            content_preview = fs_object.read_random(0, min(4096, fs_object.info.meta.size))
-            if not content_preview:
-                return
+            inode = getattr(meta, 'addr', None)
+            inode_str = str(inode) if inode is not None else 'unknown'
 
-            file_hash = hashlib.md5(content_preview).hexdigest()
-            if file_hash in seen_hashes:
-                return
-
-            seen_hashes.add(file_hash)
-
-            name_str = fs_object.info.name.name.decode('utf-8', 'ignore') if (fs_object.info.name and hasattr(fs_object.info.name, 'name')) else "orphaned_file"
-            inode = str(fs_object.info.meta.addr) if hasattr(fs_object.info.meta, 'addr') else "unknown"
-
+            # Count that we inspected a candidate (for timing/estimates)
             try:
-                file_type = magic.from_buffer(content_preview, mime=True)
-            except:
-                file_type = "unknown"
+                deleted_scan_status.setdefault('validation_stats', {}).setdefault('total_scanned', 0)
+                deleted_scan_status['validation_stats']['total_scanned'] += 1
+            except Exception:
+                pass
 
-            file_info = {
-                'inode': inode,
-                'name': name_str,
-                'size': fs_object.info.meta.size,
-                'offset': file_offset,
-                'offset_decimal': fs_object.info.meta.addr if hasattr(fs_object.info.meta, 'addr') else 0,
-                'mtime': datetime.datetime.fromtimestamp(fs_object.info.meta.mtime).strftime('%Y-%m-%d %H:%M:%S') if fs_object.info.meta.mtime else 'Unknown',
-                'ctime': datetime.datetime.fromtimestamp(fs_object.info.meta.ctime).strftime('%Y-%m-%d %H:%M:%S') if fs_object.info.meta.ctime else 'Unknown',
-                'recovery_method': recovery_method,
-                'file_type': file_type,
-                'fs_offset': fs_offset
-            }
-            
-            # Save the actual file content
+            # Quick signature
+            quick_hash, head, tail = _compute_quick_hash(fs_object, size)
+            quick_key = (size, quick_hash)
+            if quick_key in seen_quick:
+                # quick filter considered duplicate - increment duplicate counter
+                try:
+                    deleted_scan_status.setdefault('validation_stats', {})
+                    deleted_scan_status['validation_stats']['duplicate_rejected'] = deleted_scan_status['validation_stats'].get('duplicate_rejected', 0) + 1
+                except Exception:
+                    pass
+                return
+
+            # If quick key unique so far, compute full SHA256 while streaming to temp file
+            import tempfile
+            safe_name_root = secure_filename(getattr(getattr(fs_object.info, 'name', None), 'name', b'orphaned').decode('utf-8', 'ignore'))
+            tmp_file = None
+            final_name = None
             try:
-                full_content = fs_object.read_random(0, min(fs_object.info.meta.size, 100*1024*1024))  # Limit to 100MB
-                safe_filename = f"deleted_{inode}_{secure_filename(name_str)}"
-                save_path = os.path.join(recovery_dir, safe_filename)
-                
-                with open(save_path, 'wb') as f:
-                    f.write(full_content)
-                
-                # Store in database with offset info
-                deleted_files_db[safe_filename] = file_info
+                tmp_fd = tempfile.NamedTemporaryFile(delete=False, dir=recovery_dir)
+                tmp_file = tmp_fd
+                sha_hex, written = _compute_full_hash_and_write(fs_object, size, tmp_file)
+                tmp_file.close()
+
+                if not sha_hex or written == 0:
+                    # empty or couldn't write - count as empty_rejected
+                    try:
+                        deleted_scan_status.setdefault('validation_stats', {})
+                        if written == 0:
+                            deleted_scan_status['validation_stats']['empty_rejected'] = deleted_scan_status['validation_stats'].get('empty_rejected', 0) + 1
+                        else:
+                            deleted_scan_status['validation_stats']['invalid_rejected'] = deleted_scan_status['validation_stats'].get('invalid_rejected', 0) + 1
+                    except Exception:
+                        pass
+                    try:
+                        os.unlink(tmp_fd.name)
+                    except Exception:
+                        pass
+                    return
+
+                # Full dedupe
+                if sha_hex in seen_full:
+                    # duplicate content, drop tmp
+                    try:
+                        os.unlink(tmp_fd.name)
+                    except Exception:
+                        pass
+                    seen_quick.add(quick_key)
+                    try:
+                        deleted_scan_status.setdefault('validation_stats', {})
+                        deleted_scan_status['validation_stats']['duplicate_rejected'] = deleted_scan_status['validation_stats'].get('duplicate_rejected', 0) + 1
+                    except Exception:
+                        pass
+                    return
+
+                # Unique, move to final path atomically
+                seen_full.add(sha_hex)
+                seen_quick.add(quick_key)
+
+                timestamp_mtime = getattr(meta, 'mtime', None)
+                mtime = datetime.datetime.fromtimestamp(timestamp_mtime).strftime('%Y-%m-%d %H:%M:%S') if timestamp_mtime else 'Unknown'
+                ctime_val = getattr(meta, 'ctime', None)
+                ctime = datetime.datetime.fromtimestamp(ctime_val).strftime('%Y-%m-%d %H:%M:%S') if ctime_val else 'Unknown'
+
+                # Use a standardized deleted file name (sequential) and include best-effort extension
+                # Determine a sensible extension as before
+                detected_ext = ''
+                try:
+                    file_type = magic.from_buffer(head, mime=True) if head else 'unknown'
+                    if file_type and file_type != 'unknown' and '/' in file_type:
+                        import mimetypes
+                        guessed = mimetypes.guess_extension(file_type.split(';')[0].strip())
+                        if guessed:
+                            detected_ext = guessed
+                except Exception:
+                    detected_ext = ''
+
+                if not detected_ext:
+                    try:
+                        head_bytes = head or b''
+                        for cat, sigs in FILE_SIGNATURES.items():
+                            for name, meta in sigs.items():
+                                hdr = meta.get('header')
+                                if hdr and head_bytes.startswith(hdr):
+                                    detected_ext = meta.get('extension', '')
+                                    break
+                            if detected_ext:
+                                break
+                    except Exception:
+                        detected_ext = ''
+
+                # Generate a sequential filename under the deleted_files_recovery_* pattern
+                seq = sum(1 for _ in os.listdir(recovery_dir) if os.path.isfile(os.path.join(recovery_dir, _))) + 1
+                final_name = generate_deleted_filename(seq, detected_ext)
+                final_path = os.path.join(recovery_dir, final_name)
+                # ensure unique final filename
+                if os.path.exists(final_path):
+                    final_path = final_path + f"_{int(time.time())}"
+
+                try:
+                    os.replace(tmp_fd.name, final_path)
+                except Exception:
+                    # fallback: copy then remove
+                    try:
+                        with open(tmp_fd.name, 'rb') as r, open(final_path, 'wb') as w:
+                            while True:
+                                b = r.read(CHUNK_SIZE)
+                                if not b:
+                                    break
+                                w.write(b)
+                        os.unlink(tmp_fd.name)
+                    except Exception:
+                        pass
+
+                try:
+                    file_type = magic.from_buffer(head, mime=True) if head else 'unknown'
+                except Exception:
+                    file_type = 'unknown'
+
+                # Determine a sensible file extension from the mime type or known signatures
+                try:
+                    ext = None
+                    if file_type and file_type != 'unknown' and '/' in file_type:
+                        import mimetypes
+                        ext = mimetypes.guess_extension(file_type.split(';')[0].strip())
+                    # Fallback: check known FILE_SIGNATURES headers
+                    if not ext:
+                        try:
+                            head_bytes = head or b''
+                            for cat, sigs in FILE_SIGNATURES.items():
+                                for name, meta in sigs.items():
+                                    hdr = meta.get('header')
+                                    if hdr and head_bytes.startswith(hdr):
+                                        ext = meta.get('extension')
+                                        break
+                                if ext:
+                                    break
+                        except Exception:
+                            ext = None
+                    if not ext:
+                        ext = ''
+                except Exception:
+                    ext = ''
+
+                # Normalize safe_name_root: avoid duplicate extension if already present
+                safe_root = safe_name_root
+                if ext and safe_root.lower().endswith(ext.lower()):
+                    final_basename = safe_root
+                else:
+                    final_basename = safe_root + (ext or '')
+
+                file_info = {
+                    'inode': inode_str,
+                    'name': safe_name_root,
+                    'size': size,
+                    'offset': f"0x{meta.addr:08X}" if hasattr(meta, 'addr') and meta.addr is not None else 'Unknown',
+                    'offset_decimal': int(getattr(meta, 'addr', 0) or 0),
+                    'mtime': mtime,
+                    'ctime': ctime,
+                    'recovery_method': recovery_method,
+                    'file_type': file_type,
+                    'sha256': sha_hex,
+                    'path': final_path,
+                    'fs_offset': fs_offset
+                }
+                deleted_files_db[os.path.basename(final_path)] = file_info
+                # Update aggregated status (update_status will increment valid_recovered)
                 update_status(recovery_method)
-                
+
             except Exception as e:
-                print(f"Error saving deleted file: {e}")
-        except Exception as e:
-            print(f"Error processing deleted file: {e}")
+                # cleanup tmp file if present
+                try:
+                    if tmp_file is not None and hasattr(tmp_file, 'name'):
+                        os.unlink(tmp_file.name)
+                except Exception:
+                    pass
+                return
+
+        except Exception:
+            return
 
     try:
         img_handle = pytsk3.Img_Info(filepath)
@@ -2000,7 +2440,7 @@ def generate_csv_zip_report_data(case_details, evidence_file, carved_files, dele
     return memory_file
 
 # --- HTML TEMPLATES ---
-BASE_TEMPLATE = """
+BASE_TEMPLATE = r"""
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -2008,6 +2448,36 @@ BASE_TEMPLATE = """
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>ForensicCarver Pro</title>
     <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Minimal local fallback utilities: used when Tailwind CDN is unavailable (keeps layout usable under Apache/offline) -->
+    <style id="fallback-utilities">
+        /* Layout helpers used by the templates (small subset of Tailwind) */
+        .flex { display: flex !important; }
+        .h-screen { height: 100vh !important; }
+        .w-64 { width: 16rem !important; }
+        .p-4 { padding: 1rem !important; }
+        .p-8 { padding: 2rem !important; }
+        .overflow-y-auto { overflow-y: auto !important; }
+        .flex-shrink-0 { flex-shrink: 0 !important; }
+        .flex-1 { flex: 1 1 auto !important; }
+        .rounded-lg { border-radius: 0.5rem !important; }
+        .block { display: block !important; }
+        .mb-8 { margin-bottom: 2rem !important; }
+        .text-white { color: #ffffff !important; }
+        .text-xs { font-size: 0.75rem !important; }
+        .font-bold { font-weight: 700 !important; }
+        .font-normal { font-weight: 400 !important; }
+        .text-2xl { font-size: 1.5rem !important; }
+        .space-y-2 > * + * { margin-top: 0.5rem !important; }
+        .hover\:bg-gray-700:hover { background-color: #374151 !important; }
+        .cursor-not-allowed { cursor: not-allowed !important; opacity: 0.7 !important; }
+        .text-gray-400 { color: #9ca3af !important; }
+        .pt-4 { padding-top: 1rem !important; }
+        /* Simple responsive helpers */
+        @media (max-width: 640px) {
+            .w-64 { width: 12rem !important; }
+            .p-8 { padding: 1rem !important; }
+        }
+    </style>
     <style>
         body { 
             background-color: #111827; 
@@ -2063,6 +2533,33 @@ BASE_TEMPLATE = """
             white-space: pre-wrap; 
             word-wrap: break-word; 
         }
+        /* Highlight user input fields: keep background matching dark theme and only highlight border/outline on focus */
+        input[type="text"], input[type="search"], input[type="email"], input[type="url"], input[type="tel"], input[type="number"], input[type="password"],
+        textarea, select, [contenteditable="true"] {
+            background-color: transparent; /* keep page/card background visible */
+            border: 1px solid rgba(255,255,255,0.06);
+            color: #e5e7eb; /* light text */
+            padding: .5rem;
+            border-radius: .25rem;
+            transition: box-shadow .12s ease, border-color .12s ease, background-color .12s ease;
+            -webkit-appearance: none; /* remove native styling */
+            appearance: none;
+        }
+        input:focus, textarea:focus, select:focus, [contenteditable="true"]:focus {
+            outline: none;
+            background-color: transparent;
+            color: #e5e7eb;
+            border-color: #f59e0b; /* highlight border only */
+            box-shadow: 0 0 0 3px rgba(245,158,11,0.12);
+        }
+        /* Keep disabled/readonly inputs visually distinct but without white background */
+        input[disabled], textarea[disabled], select[disabled], input[readonly], textarea[readonly] {
+            opacity: 0.7;
+            background-color: transparent;
+            cursor: not-allowed;
+        }
+        /* For selects that show native arrow, keep color consistent */
+        select { background-image: none; }
         .encryption-badge { 
             background-color: #ef4444; 
             color: white; 
@@ -2118,6 +2615,8 @@ BASE_TEMPLATE = """
         }
     </style>
     <link rel="stylesheet" href="https://rsms.me/inter/inter.css">
+    <!-- Local fallback stylesheet (served by Flask static) -->
+    <link rel="stylesheet" href="/static/css/local_tailwind_fallback.css">
 </head>
 <body class="flex h-screen">
     <aside class="sidebar w-64 p-4 space-y-2 flex-shrink-0 overflow-y-auto">
@@ -2137,6 +2636,7 @@ BASE_TEMPLATE = """
         <a href="{{ url_for('event_log_viewer') }}" class="block p-3 rounded-lg hover:bg-gray-700 {% if request.endpoint == 'event_log_viewer' %}active{% endif %}">Event Log Viewer</a>
         <a href="{{ url_for('reporting') }}" class="block p-3 rounded-lg hover:bg-gray-700 {% if request.endpoint == 'reporting' %}active{% endif %}">Reporting</a>
         <a href="{{ url_for('manual_carving') }}" class="block p-3 rounded-lg hover:bg-gray-700 {% if request.endpoint == 'manual_carving' %}active{% endif %}">Manual Carving</a>
+         <a href="{{ url_for('database_view') }}" class="block p-3 rounded-lg hover:bg-gray-700 {% if request.endpoint == 'database_view' %}active{% endif %}">File Inspector</a>
         {% endif %}
         <div class="pt-4 text-xs text-gray-500">Version 4.3.0<br>Licensed to: Forensics Lab</div>
     </aside>
@@ -2273,11 +2773,52 @@ EVIDENCE_UPLOAD_CONTENT = """
         <div class="card p-6 rounded-lg">
             <h2 class="text-xl font-semibold text-white mb-4">Upload New Evidence File</h2>
             <p class="text-xs text-gray-400 mb-4">Supported formats: .dd, .e01, .mem, .raw, .img, .vmdk</p>
-            <form id="upload-form" method="post" enctype="multipart/form-data" class="border-2 border-dashed border-gray-600 rounded-lg p-12 text-center">
-                <p class="mb-4">Drop evidence file here or click to browse</p>
-                <input type="file" name="file" class="hidden" id="file-input">
-                <label for="file-input" class="btn-primary px-6 py-2 rounded-lg cursor-pointer">Select File</label>
-                <button type="submit" class="btn-green px-6 py-2 rounded-lg ml-4">Upload</button>
+            
+            <!-- Upload Progress Container (initially hidden) -->
+            <div id="upload-progress-container" class="hidden mb-6 p-4 bg-gray-800 rounded-lg border border-gray-600">
+                <div class="flex justify-between items-center mb-3">
+                    <h3 class="text-lg font-semibold text-white">Uploading: <span id="upload-filename" class="font-mono"></span></h3>
+                    <span id="upload-percent" class="font-bold text-blue-400 text-lg">0%</span>
+                </div>
+                
+                <div class="w-full bg-gray-700 rounded-full h-4 mb-3">
+                    <div id="upload-progress-bar" class="bg-blue-600 h-4 rounded-full transition-all duration-300" style="width: 0%"></div>
+                </div>
+                
+                <div class="grid grid-cols-1 md:grid-cols-3 gap-4 text-sm">
+                    <div class="text-center">
+                        <div class="text-gray-400 mb-1">Progress</div>
+                        <div id="upload-progress-text" class="font-mono text-white">0 B / 0 B</div>
+                    </div>
+                    <div class="text-center">
+                        <div class="text-gray-400 mb-1">Speed</div>
+                        <div id="upload-speed" class="font-mono text-white">0 B/s</div>
+                    </div>
+                    <div class="text-center">
+                        <div class="text-gray-400 mb-1">Time</div>
+                        <div id="upload-timing" class="font-mono text-white text-xs">Elapsed: 0s<br>Remaining: Calculating...</div>
+                    </div>
+                </div>
+            </div>
+            
+            <form id="upload-form" method="post" enctype="multipart/form-data" class="border-2 border-dashed border-gray-600 rounded-lg p-8 text-center">
+                <p class="mb-4 text-gray-300">Drop evidence file here or click to browse</p>
+                <!-- Support selecting multiple files (UI) so users can pick and review a list before uploading -->
+                <input type="file" name="file" class="hidden" id="file-input" onchange="updateFileInfo()" multiple>
+                <label for="file-input" class="btn-primary px-6 py-3 rounded-lg cursor-pointer inline-block mb-4">Select Files</label>
+
+                <div id="file-info" class="hidden mt-4 p-3 bg-gray-800 rounded-lg">
+                    <div id="selected-files-list" class="space-y-2 text-left">
+                        <!-- dynamically populated list of selected files -->
+                    </div>
+                    <div class="mt-3 text-right">
+                        <button type="button" id="clear-selection" class="btn-secondary px-3 py-1 text-xs rounded-lg">Clear Selection</button>
+                    </div>
+                </div>
+
+                <div class="mt-4 flex justify-center">
+                    <button type="submit" id="upload-button" class="btn-green px-8 py-3 rounded-lg font-semibold">Upload File</button>
+                </div>
             </form>
         </div>
         
@@ -2337,10 +2878,8 @@ EVIDENCE_UPLOAD_CONTENT = """
                 
                 <!-- ADDED: Clear Session button in Currently Loaded Evidence section -->
                 <div class="mt-6 pt-4 border-t border-gray-700">
-                    <a href="{{ url_for('clear_session') }}" onclick="return confirm('This will clear ALL recovered files and analysis data. Continue?');" class="bg-red-600 text-white px-6 py-3 rounded-lg w-full text-center block hover:bg-red-700 transition-colors">Clear Session</a>
+                    <a id="clear-session-btn" href="{{ url_for('clear_session') }}" onclick="return confirm('This will clear ALL recovered files and analysis data. Continue?');" class="bg-red-600 text-white px-6 py-3 rounded-lg w-full text-center block hover:bg-red-700 transition-colors">Clear Session</a>
                 </div>
-                
-                <!-- REMOVED: Quick Actions section from here (moved to Session Management) -->
             {% else %}
                 <p class="text-gray-500">No evidence file is currently loaded for analysis.</p>
             {% endif %}
@@ -2352,197 +2891,461 @@ EVIDENCE_UPLOAD_CONTENT = """
             <div class="flex flex-col space-y-4">
                 <a href="{{ url_for('forensic_analysis') }}" class="btn-primary px-6 py-3 rounded-lg text-center">Start Analysis</a>
                 <a href="{{ url_for('auto_carving_setup') }}" class="btn-green px-6 py-3 rounded-lg text-center">Go to Auto Carving</a>
-                <!-- REMOVED: Clear Session button from here (moved to Currently Loaded Evidence) -->
             </div>
         </div>
     </div>
 </div>
 
 <script>
-document.addEventListener('DOMContentLoaded', () => {
-    const uploadForm = document.getElementById('upload-form');
+// Upload progress functionality
+let currentUploadFilename = null; // filename currently being uploaded from this client
+function formatBytes(bytes) {
+    if (bytes === 0) return '0 B';
+    const k = 1024;
+    const sizes = ['B', 'KB', 'MB', 'GB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+}
+
+function formatSpeed(bytesPerSecond) {
+    return formatBytes(bytesPerSecond) + '/s';
+}
+
+function formatTime(seconds) {
+    if (seconds < 60) {
+        return Math.round(seconds) + 's';
+    } else if (seconds < 3600) {
+        const mins = Math.floor(seconds / 60);
+        const secs = Math.round(seconds % 60);
+        return mins + 'm ' + secs + 's';
+    } else {
+        const hours = Math.floor(seconds / 3600);
+        const minutes = Math.floor((seconds % 3600) / 60);
+        return hours + 'h ' + minutes + 'm';
+    }
+}
+
+function updateFileInfo() {
     const fileInput = document.getElementById('file-input');
-    const submitButton = uploadForm.querySelector('button[type="submit"]');
+    const fileInfo = document.getElementById('file-info');
+    const listContainer = document.getElementById('selected-files-list');
 
-    const progressContainer = document.getElementById('progress-container');
-    const progressBar = document.getElementById('progress-bar');
-    const progressText = document.getElementById('progress-text');
-    const progressLabel = document.getElementById('progress-label');
-    
-    // Modals
-    const uploadCompleteModal = document.getElementById('uploadCompleteModal');
-    const closeUploadModalBtn = document.getElementById('closeUploadModalBtn');
-    const uploadConfirmModal = document.getElementById('uploadConfirmModal');
-    const confirmCancelBtn = document.getElementById('confirmCancelBtn');
-    const confirmOkBtn = document.getElementById('confirmOkBtn');
-    const uploadConfirmText = document.getElementById('uploadConfirmText');
+    while (listContainer.firstChild) listContainer.removeChild(listContainer.firstChild);
 
-    let fileToUpload = null;
+    if (fileInput.files && fileInput.files.length > 0) {
+        Array.from(fileInput.files).forEach((file, idx) => {
+            const row = document.createElement('div');
+            row.className = 'flex justify-between items-center p-2 border border-gray-700 rounded-md';
 
-    if (closeUploadModalBtn) {
-        closeUploadModalBtn.onclick = function() {
-            uploadCompleteModal.style.display = "none";
-            window.location.reload();
-        }
+            const left = document.createElement('div');
+            left.innerHTML = `<div class="font-mono text-sm text-white">${escapeHtml(file.name)}</div><div class="text-xs text-gray-400">${formatBytes(file.size)}</div>`;
+
+            const right = document.createElement('div');
+            right.className = 'flex items-center space-x-2';
+
+            const removeBtn = document.createElement('button');
+            removeBtn.type = 'button';
+            removeBtn.className = 'btn-secondary px-2 py-1 text-xs rounded-lg';
+            removeBtn.textContent = 'Remove';
+            removeBtn.addEventListener('click', () => {
+                // Remove this file from the FileList by creating a new DataTransfer
+                const dt = new DataTransfer();
+                Array.from(fileInput.files).forEach((f, i) => { if (i !== idx) dt.items.add(f); });
+                fileInput.files = dt.files;
+                updateFileInfo();
+            });
+
+            right.appendChild(removeBtn);
+            row.appendChild(left);
+            row.appendChild(right);
+            listContainer.appendChild(row);
+        });
+
+        fileInfo.classList.remove('hidden');
+    } else {
+        fileInfo.classList.add('hidden');
     }
-    
-    if (confirmCancelBtn) {
-        confirmCancelBtn.onclick = function() {
-            uploadConfirmModal.style.display = "none";
-            resetUploadButton();
-        }
-    }
-    
-    if (confirmOkBtn) {
-        confirmOkBtn.onclick = function() {
-            uploadConfirmModal.style.display = "none";
-            if(fileToUpload) {
-                performUpload(fileToUpload);
+}
+
+function updateUploadProgress() {
+    fetch('/upload_status')
+        .then(response => {
+            if (!response.ok) throw new Error('Network error');
+            return response.json();
+        })
+        .then(data => {
+            console.log('Upload status:', data);
+            
+            const progressContainer = document.getElementById('upload-progress-container');
+            const progressBar = document.getElementById('upload-progress-bar');
+            const progressPercent = document.getElementById('upload-percent');
+            const progressText = document.getElementById('upload-progress-text');
+            const uploadSpeed = document.getElementById('upload-speed');
+            const uploadTiming = document.getElementById('upload-timing');
+            const uploadFilename = document.getElementById('upload-filename');
+            const uploadButton = document.getElementById('upload-button');
+            
+            if (data.in_progress) {
+                // Show progress container
+                progressContainer.classList.remove('hidden');
+                
+                // Update progress bar
+                progressBar.style.width = data.progress + '%';
+                progressPercent.textContent = data.progress + '%';
+                
+                // Update file info
+                uploadFilename.textContent = data.filename || 'Unknown file';
+                
+                // Update progress text
+                progressText.textContent = `${formatBytes(data.bytes_uploaded)} / ${formatBytes(data.total_bytes)}`;
+                
+                // Update speed and timing
+                uploadSpeed.textContent = data.upload_speed ? formatSpeed(data.upload_speed) : 'Calculating...';
+                uploadTiming.innerHTML = `Elapsed: ${data.elapsed_time || '0s'}<br>Remaining: ${data.time_remaining_str || 'Calculating...'}`;
+                
+                // Update button state
+                uploadButton.disabled = true;
+                uploadButton.textContent = 'Uploading...';
+                uploadButton.classList.add('opacity-50');
+                
+                // Continue polling
+                setTimeout(updateUploadProgress, 500);
+            } else if (data.progress === 100 || data.complete) {
+                // Upload complete
+                progressBar.style.width = '100%';
+                progressBar.classList.remove('bg-blue-600');
+                progressBar.classList.add('bg-green-600');
+                progressPercent.textContent = '100%';
+                progressPercent.classList.remove('text-blue-400');
+                progressPercent.classList.add('text-green-400');
+                
+                uploadTiming.innerHTML = `Upload complete!<br>Total time: ${data.elapsed_time || 'Unknown'}`;
+                uploadSpeed.textContent = 'Complete';
+                
+                // Reset button
+                uploadButton.disabled = false;
+                uploadButton.textContent = 'Upload File';
+                uploadButton.classList.remove('opacity-50');
+                
+                // Reload page after delay to show the new file
+                setTimeout(() => {
+                    window.location.reload();
+                }, 2000);
+            } else {
+                // Upload not in progress
+                progressContainer.classList.add('hidden');
+                uploadButton.disabled = false;
+                uploadButton.textContent = 'Upload File';
+                uploadButton.classList.remove('opacity-50');
             }
-        }
-    }
+        })
+        .catch(error => {
+            console.error('Error fetching upload status:', error);
+            const uploadButton = document.getElementById('upload-button');
+            uploadButton.disabled = false;
+            uploadButton.textContent = 'Upload File';
+            uploadButton.classList.remove('opacity-50');
+        });
+}
 
-    uploadForm.addEventListener('submit', function(e) {
-        e.preventDefault();
-        if (!fileInput.files || fileInput.files.length === 0) {
-            alert('Please select a file to upload.');
-            return;
-        }
-        const file = fileInput.files[0];
-        const fileSizeGB = file.size / (1024 * 1024 * 1024);
-        submitButton.disabled = true;
-        submitButton.textContent = 'Uploading...';
-        progressContainer.classList.remove('hidden');
-        if (fileSizeGB > 1) {
-            fileToUpload = file;
-            uploadConfirmText.textContent = `You are uploading a large file (${fileSizeGB.toFixed(2)} GB). This may take a significant amount of time. Do you want to continue?`;
-            uploadConfirmModal.style.display = 'block';
+function uploadFileWithProgress(file, onComplete) {
+    const xhr = new XMLHttpRequest();
+    const formData = new FormData();
+    formData.append('file', file);
+
+    const progressContainer = document.getElementById('upload-progress-container');
+    const uploadFilename = document.getElementById('upload-filename');
+    const uploadButton = document.getElementById('upload-button');
+    const progressBar = document.getElementById('upload-progress-bar');
+    const progressPercent = document.getElementById('upload-percent');
+    const progressText = document.getElementById('upload-progress-text');
+    const uploadSpeed = document.getElementById('upload-speed');
+    const uploadTiming = document.getElementById('upload-timing');
+
+    progressContainer.classList.remove('hidden');
+    uploadFilename.textContent = file.name;
+    uploadButton.disabled = true;
+    uploadButton.textContent = 'Uploading...';
+    uploadButton.classList.add('opacity-50');
+
+    let startTime = Date.now();
+    // mark this client as the originator of this upload so status polls won't
+    // trigger unrelated page reloads for other uploads
+    currentUploadFilename = file.name;
+
+    xhr.upload.addEventListener('progress', function(evt) {
+        if (evt.lengthComputable) {
+            const MAX_BYTES = 60 * 1024 * 1024 * 1024; // 60 GB
+            if (evt.loaded > MAX_BYTES) {
+                // Abort and request server to cleanup partial upload, then restart
+                console.warn('Upload exceeded 60GB threshold, aborting and restarting');
+                xhr.abort();
+                // Ask server to remove partial file
+                fetch('/ajax_upload_abort', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ filename: file.name }) })
+                    .then(() => {
+                        // restart after short delay
+                        setTimeout(() => { uploadFileWithProgress(file); }, 1500);
+                    })
+                    .catch((e) => { console.error('Abort cleanup failed', e); });
+                return;
+            }
+            const percent = Math.round((evt.loaded / evt.total) * 100);
+            progressBar.style.width = percent + '%';
+            progressPercent.textContent = percent + '%';
+            progressText.textContent = `${formatBytes(evt.loaded)} / ${formatBytes(evt.total)}`;
+
+            const elapsed = (Date.now() - startTime) / 1000;
+            const speed = evt.loaded / Math.max(elapsed, 0.001);
+            uploadSpeed.textContent = formatSpeed(speed);
+
+            const estimatedTotal = evt.total / Math.max(speed, 0.001);
+            const remaining = Math.max(0, estimatedTotal - elapsed);
+            uploadTiming.innerHTML = `Elapsed: ${formatTime(elapsed)}<br>Remaining: ${formatTime(remaining)}`;
         } else {
-            performUpload(file);
+            // Fallback when total size unknown
+            progressBar.style.width = '50%';
+            progressPercent.textContent = 'Uploading...';
+            progressText.textContent = `${formatBytes(evt.loaded)} / ?`;
+            uploadSpeed.textContent = 'Calculating...';
+            uploadTiming.innerHTML = `Elapsed: ${formatTime((Date.now() - startTime) / 1000)}<br>Remaining: Calculating...`;
         }
     });
 
-    function resetUploadButton() {
-        submitButton.disabled = false;
-        submitButton.textContent = 'Upload';
-        progressContainer.classList.add('hidden');
-        fileInput.value = '';
-    }
-    
-    function performUpload(file) {
-        const formData = new FormData();
-        formData.append('file', file);
-        const xhr = new XMLHttpRequest();
-        xhr.open('POST', '{{ url_for("evidence_upload") }}', true);
-        xhr.upload.addEventListener('progress', function(e) {
-            if (e.lengthComputable) {
-                const percentComplete = Math.round((e.loaded / e.total) * 100);
-                progressBar.style.width = percentComplete + '%';
-                const loadedMB = (e.loaded / (1024*1024)).toFixed(2);
-                const totalMB = (e.total / (1024*1024)).toFixed(2);
-                progressText.textContent = `${percentComplete}% (${loadedMB} MB / ${totalMB} MB)`;
-                if(percentComplete === 100) {
-                    progressLabel.textContent = "Upload complete. Server is now processing the file...";
-                }
-            }
-        });
-        xhr.onload = function() {
-            if (xhr.status === 200 || xhr.status === 302) {
-                window.location.href = xhr.responseURL;
-            } else {
-                alert(`An error occurred during the upload: ${xhr.statusText}`);
-                resetUploadButton();
-            }
-        };
-        xhr.onerror = function() {
-            alert('An error occurred. Please check your network connection and try again.');
-            resetUploadButton();
-        };
-        xhr.send(formData);
-    }
+    xhr.onreadystatechange = function() {
+        if (xhr.readyState === XMLHttpRequest.DONE) {
+            try {
+                const data = JSON.parse(xhr.responseText || '{}');
 
-    function updateDecryptionStatus() {
-        fetch('/decryption_status')
-            .then(response => response.json())
-            .then(data => {
-                if (!data.filename) return;
-                const fileElements = document.querySelectorAll('[id^=file-status-]');
-                let fileIndex = -1;
-                fileElements.forEach((el, index) => {
-                    const monoElement = el.querySelector('.font-mono');
-                    if (monoElement && monoElement.textContent === data.filename) {
-                        fileIndex = index;
-                    }
-                });
-                if (fileIndex === -1) return;
-                
-                const badge = document.getElementById(`decryption-badge-${fileIndex}`);
-                const statusText = document.getElementById(`decryption-status-text-${fileIndex}`);
-                if (data.in_progress) {
-                    badge.innerHTML = '<span class="decrypting-badge">DECRYPTING...</span>';
-                    statusText.innerHTML = `<span class="text-yellow-400">Status: ${data.message} (Attempt ${data.attempts})</span>`;
-                    setTimeout(updateDecryptionStatus, 1000);
-                } else if (data.complete) {
-                    if (data.success) {
-                        badge.innerHTML = '<span class="decryption-badge">DECRYPTED</span>';
-                        statusText.innerHTML = '<span class="text-green-400">Decryption was successful! Reloading...</span>';
-                        setTimeout(() => window.location.reload(), 1500);
+                if (xhr.status >= 200 && xhr.status < 300 && data.success) {
+                    progressBar.style.width = '100%';
+                    progressBar.classList.remove('bg-blue-600');
+                    progressBar.classList.add('bg-green-600');
+                    progressPercent.textContent = '100%';
+                    progressText.textContent = 'Upload complete!';
+                    uploadSpeed.textContent = 'Complete';
+                    uploadTiming.innerHTML = `Upload successful!<br>Total time: ${data.elapsed_time || 'Unknown'}`;
+                    // clear our marker before continuing
+                    currentUploadFilename = null;
+                    if (typeof onComplete === 'function') {
+                        onComplete(null, data);
                     } else {
-                        badge.innerHTML = '<span class="encryption-badge">ENCRYPTED</span>';
-                        statusText.innerHTML = `<span class="text-red-400">${data.message} - <a href="${window.location.href.replace('evidence_upload', 'decryption/' + data.filename)}" class="text-blue-400 hover:underline">Try again</a></span>`;
+                        setTimeout(() => { window.location.reload(); }, 1200);
                     }
+                } else {
+                    throw new Error(data.error || 'Upload failed');
                 }
-            });
-    }
+            } catch (err) {
+                console.error('Upload response error:', err);
+                // clear upload marker on error so other status updates work normally
+                currentUploadFilename = null;
+                progressBar.style.width = '100%';
+                progressBar.classList.remove('bg-blue-600');
+                progressBar.classList.add('bg-red-600');
+                progressPercent.textContent = 'Error';
+                progressText.textContent = 'Upload failed: ' + (err.message || 'Unknown');
+                setTimeout(() => {
+                    uploadButton.disabled = false;
+                    uploadButton.textContent = 'Upload File';
+                    uploadButton.classList.remove('opacity-50');
+                    progressContainer.classList.add('hidden');
+                    if (typeof onComplete === 'function') onComplete(err);
+                }, 3000);
+            }
+        }
+    };
 
-    {% if uploaded_files_db %}
-        {% for filename, details in uploaded_files_db.items() %}
-            {% if details.encryption_status.decrypting %}
-                updateDecryptionStatus();
-            {% endif %}
-        {% endfor %}
-    {% endif %}
+    // network-level errors (connection reset, etc.)
+    xhr.onerror = function() {
+        console.error('Upload network error');
+        currentUploadFilename = null;
+        progressBar.style.width = '100%';
+        progressBar.classList.remove('bg-blue-600');
+        progressBar.classList.add('bg-red-600');
+        progressPercent.textContent = 'Error';
+        progressText.textContent = 'Network error during upload.';
+        setTimeout(() => {
+            uploadButton.disabled = false;
+            uploadButton.textContent = 'Upload File';
+            uploadButton.classList.remove('opacity-50');
+            progressContainer.classList.add('hidden');
+        }, 3000);
+    };
+
+    xhr.open('POST', '/ajax_upload', true);
+    xhr.send(formData);
+}
+
+document.addEventListener('DOMContentLoaded', function() {
+    const uploadForm = document.getElementById('upload-form');
+    const fileInput = document.getElementById('file-input');
+    const uploadButton = document.getElementById('upload-button');
+
+    // Update file info when file is selected
+    fileInput.addEventListener('change', updateFileInfo);
+
+    uploadForm.addEventListener('submit', function(e) {
+        e.preventDefault();
+
+        if (!fileInput.files || fileInput.files.length === 0) {
+            alert('Please select one or more files to upload.');
+            return;
+        }
+
+        const files = Array.from(fileInput.files);
+
+        // Confirm large total size
+        const totalBytes = files.reduce((acc, f) => acc + f.size, 0);
+        const totalMB = totalBytes / (1024 * 1024);
+        if (totalMB > 100) {
+            if (!confirm(`The combined selection is ${(totalMB).toFixed(2)} MB. Large uploads may take a while. Continue?`)) {
+                return;
+            }
+        }
+
+        // Upload files sequentially to avoid confusing concurrent progress indicators
+        let i = 0;
+        function uploadNext(err) {
+            if (err) {
+                console.error('Upload aborted due to error:', err);
+                return;
+            }
+            if (i >= files.length) {
+                // All done — reload to show new files
+                setTimeout(() => { window.location.reload(); }, 800);
+                return;
+            }
+            const f = files[i++];
+            uploadFileWithProgress(f, uploadNext);
+        }
+
+        uploadNext();
+    });
+    
+    // Initialize progress display
+    updateUploadProgress();
+
+    // Ensure Clear Session button always navigates (some browsers or other scripts
+    // might interfere with normal anchor navigation when large uploads are in progress)
+    try {
+        const clearBtn = document.getElementById('clear-session-btn');
+        if (clearBtn) {
+            clearBtn.addEventListener('click', function(evt) {
+                // The anchor already has an inline confirm; double-check here too
+                if (!confirm('This will clear ALL recovered files and analysis data. Continue?')) {
+                    evt.preventDefault();
+                    return;
+                }
+                // Use a robust navigation method to avoid other scripts preventing default
+                evt.preventDefault();
+                const href = clearBtn.getAttribute('href');
+                setTimeout(() => { window.location.assign(href); }, 50);
+            });
+        }
+    } catch (e) {
+        console.error('Clear Session handler setup failed', e);
+    }
 });
 </script>
 """
-
 ENCRYPTION_PAGE_CONTENT = """
 <h1 class="text-3xl font-bold text-white mb-4">File Encryption</h1>
-<p class="text-gray-400 mb-8">Upload a file and provide a password to encrypt it using AES-256 with a derived key (PBKDF2-HMAC-SHA256).</p>
+<p class="text-gray-400 mb-8">Encrypt files using Fernet encryption with password protection.</p>
 
-{% if message %}
-<div class="card p-6 rounded-lg mb-8 border {% if success %}border-green-500{% else %}border-red-500{% endif %}">
-    <h2 class="text-xl font-semibold {% if success %}text-green-400{% else %}text-red-400{% endif %} mb-4">
-        {% if success %}✅ Encryption Successful{% else %}❌ Encryption Failed{% endif %}
-    </h2>
-    <p class="text-gray-300 mb-6">{{ message.split('. ')[0] + '.' }}</p>
-    {% if success and encrypted_filename %}
-    <div class="text-center">
-        <a href="{{ url_for('download_encrypted', filename=encrypted_filename) }}" class="btn-primary inline-block px-8 py-3 rounded-lg font-semibold">
-            Download {{ encrypted_filename }}
-        </a>
+<div class="grid grid-cols-1 lg:grid-cols-2 gap-8">
+    <div class="card p-6 rounded-lg">
+        <h2 class="text-xl font-semibold text-white mb-4">Encrypt a File</h2>
+        
+        <form action="{{ url_for('encrypt_file') }}" method="post" enctype="multipart/form-data" class="space-y-6">
+            <div>
+                <label class="block text-sm font-medium text-gray-300">Select File to Encrypt</label>
+                <input type="file" name="file" class="mt-1 block w-full bg-gray-800 border-gray-600 rounded-md shadow-sm p-2 text-white" required>
+            </div>
+            
+            <div>
+                <label class="block text-sm font-medium text-gray-300">Password</label>
+                <input type="password" name="password" class="mt-1 block w-full bg-gray-800 border-gray-600 rounded-md shadow-sm p-2 text-white" placeholder="Enter strong password" required>
+                <p class="mt-1 text-xs text-gray-400">Use a strong password. The file will be encrypted using AES-128 in CBC mode.</p>
+            </div>
+            
+            <div>
+                <label class="block text-sm font-medium text-gray-300">Confirm Password</label>
+                <input type="password" name="confirm_password" class="mt-1 block w-full bg-gray-800 border-gray-600 rounded-md shadow-sm p-2 text-white" placeholder="Confirm password" required>
+            </div>
+            
+            <button type="submit" class="btn-primary w-full py-3 rounded-lg font-semibold">Encrypt File</button>
+        </form>
     </div>
-    {% endif %}
+    
+    <div class="card p-6 rounded-lg">
+        <h2 class="text-xl font-semibold text-white mb-4">Encryption Information</h2>
+        
+        <div class="space-y-4">
+            <div class="p-4 bg-blue-900 border border-blue-700 rounded-lg">
+                <h3 class="font-semibold text-blue-300 mb-2">🔒 Encryption Method</h3>
+                <p class="text-sm text-blue-200">Files are encrypted using Fernet (AES-128 in CBC mode) with PBKDF2 key derivation.</p>
+            </div>
+            
+            <div class="p-4 bg-green-900 border border-green-700 rounded-lg">
+                <h3 class="font-semibold text-green-300 mb-2">🔑 Key Security</h3>
+                <p class="text-sm text-green-200">Keys are derived from your password using 480,000 iterations of PBKDF2 with a random 16-byte salt.</p>
+            </div>
+            
+            <div class="p-4 bg-purple-900 border border-purple-700 rounded-lg">
+                <h3 class="font-semibold text-purple-300 mb-2">📁 File Format</h3>
+                <p class="text-sm text-purple-200">Encrypted files include a custom header, salt, and encrypted data. They can be decrypted using this application.</p>
+            </div>
+            
+            <div class="p-4 bg-yellow-900 border border-yellow-700 rounded-lg">
+                <h3 class="font-semibold text-yellow-300 mb-2">⚠️ Important Notes</h3>
+                <ul class="text-sm text-yellow-200 list-disc list-inside space-y-1">
+                    <li>Keep your password safe - it cannot be recovered</li>
+                    <li>Encrypted files will have a .enc extension</li>
+                    <li>Original files are not modified - new encrypted copies are created</li>
+                    <li>Use strong, unique passwords for each file</li>
+                </ul>
+            </div>
+        </div>
+    </div>
+</div>
+
+{% if encrypted_files %}
+<div class="card p-6 rounded-lg mt-8">
+    <h2 class="text-xl font-semibold text-white mb-4">Recently Encrypted Files</h2>
+    <div class="space-y-2">
+        {% for file_info in encrypted_files %}
+        <div class="p-3 border border-gray-600 rounded-lg flex justify-between items-center">
+            <div>
+                <span class="font-mono text-white">{{ file_info.filename }}</span>
+                <span class="ml-2 text-xs text-gray-400">({{ file_info.size }})</span>
+            </div>
+            <div class="flex space-x-2">
+                <a href="{{ url_for('download_encrypted_file', filename=file_info.filename) }}" 
+                   class="btn-primary px-3 py-1 text-xs rounded-lg">Download</a>
+                <a href="{{ url_for('delete_encrypted_file', filename=file_info.filename) }}" 
+                   onclick="return confirm('Delete this encrypted file?');" 
+                   class="bg-red-600 text-white px-3 py-1 text-xs rounded-lg">Delete</a>
+            </div>
+        </div>
+        {% endfor %}
+    </div>
 </div>
 {% endif %}
 
-<div class="card p-6 rounded-lg">
-    <h2 class="text-xl font-semibold text-white mb-4">Encrypt a New File</h2>
-    <form action="{{ url_for('encryption_page') }}" method="post" enctype="multipart/form-data" class="space-y-6">
-        <div>
-            <label for="file" class="block text-sm font-medium text-gray-300">Select File to Encrypt</label>
-            <input type="file" name="file" id="file" required class="mt-1 block w-full text-gray-300 file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-sm file:font-semibold file:bg-blue-50 file:text-blue-700 hover:file:bg-blue-100">
-        </div>
-        <div>
-            <label for="password" class="block text-sm font-medium text-gray-300">Encryption Password</label>
-            <input type="password" name="password" id="password" required class="mt-1 block w-full bg-gray-800 border-gray-600 rounded-md shadow-sm p-2 text-white">
-        </div>
-        <div class="pt-2">
-            <button type="submit" class="btn-green w-full py-2 rounded-lg font-semibold">Encrypt File</button>
-        </div>
-    </form>
+{% if newly_encrypted_file %}
+
+<div class="card p-6 rounded-lg mb-8 bg-green-900 border border-green-700">
+<h2 class="text-xl font-semibold text-white mb-4">✅ Encryption Successful</h2>
+<p class="text-green-200 mb-4">Your file <strong class="font-mono">{{ newly_encrypted_file }}</strong> has been encrypted and is ready for download.</p>
+<a href="{{ url_for('download_encrypted_file', filename=newly_encrypted_file) }}"
+class="btn-primary px-6 py-3 rounded-lg font-semibold inline-block">
+Download Now
+</a>
 </div>
+{% endif %}
+
 """
+
+
 DECRYPTION_PAGE_CONTENT = """
 <h1 class="text-3xl font-bold text-white mb-4">File Decryption</h1>
 <p class="text-gray-400 mb-8">The loaded evidence file <strong class="font-mono">{{ filename }}</strong> appears to be encrypted.</p>
@@ -3061,12 +3864,7 @@ function updateProgress() {
             document.getElementById('current-offset').innerText = data.current_offset;
             document.getElementById('files-found').innerText = data.files_found;
             document.getElementById('total-found-count').innerText = data.files_found;
-            // In the updateProgress function, add:
-document.getElementById('elapsed-time').textContent = data.elapsed_time || '0s';
-document.getElementById('time-remaining').textContent = data.time_remaining_str || 'Calculating...';
-if (data.estimated_total_time) {
-    document.getElementById('total-estimated').textContent = data.estimated_total_time;
-}  
+            // timing placeholders will be handled below with better fallbacks
             
             const liveHexView = document.getElementById('live-hex-view');
             const recentFiles = data.found_files_list.slice(-5).reverse();
@@ -3095,12 +3893,26 @@ if (data.estimated_total_time) {
                 }
                 const viewBtn = document.getElementById('view-recovered-btn');
                 viewBtn.classList.remove('opacity-50', 'pointer-events-none');
-            } else {
-                setTimeout(updateProgress, 1000);
             }
+
+            // Ensure elapsed / remaining display always shows a sensible fallback
+            const elapsedEl = document.getElementById('elapsed-time');
+            const remainingEl = document.getElementById('time-remaining');
+            const totalEstEl = document.getElementById('total-estimated');
+            elapsedEl.textContent = data.elapsed_time || '0s';
+            remainingEl.textContent = data.time_remaining_str || (data.estimated_total_time ? 'Calculating...' : 'Calculating...');
+            totalEstEl.textContent = data.estimated_total_time || 'Calculating...';
+        })
+        .catch(err => {
+            console.error('Error fetching carving status:', err);
         });
 }
-document.addEventListener('DOMContentLoaded', updateProgress);
+
+// Start polling when the page is ready. Use setInterval to be resilient.
+document.addEventListener('DOMContentLoaded', function() {
+    updateProgress();
+    setInterval(updateProgress, 1000);
+});
 </script>
 """
 
@@ -3269,7 +4081,10 @@ MANUAL_CARVING_CONTENT = """
                 <input type="number" name="length" class="mt-1 block w-full bg-gray-800 border-gray-600 rounded-md shadow-sm p-2 text-white" placeholder="Number of bytes to extract" required min="1">
             </div>
             
-            <button type="submit" class="btn-green w-full py-2 rounded-lg font-semibold">Carve Data</button>
+            <div class="flex space-x-2">
+                <button type="submit" class="btn-green flex-1 py-2 rounded-lg font-semibold">Carve Data</button>
+                <button type="button" id="preview-hex-btn" class="btn-secondary py-2 rounded-lg px-4" onclick="previewHexFromForm()">Preview Hex (Scrabble)</button>
+            </div>
         </form>
 
         <div class="mt-6 p-4 bg-gray-800 rounded-lg">
@@ -3387,6 +4202,211 @@ function fillOffsetAndLength(offset, length) {
     document.querySelector('input[name="start_offset"]').value = offset;
     document.querySelector('input[name="length"]').value = length;
 }
+</script>
+<!-- Hex Preview Modal -->
+<div id="hexPreviewModal" class="modal">
+    <div class="modal-content">
+        <span class="close" id="hexPreviewClose">&times;</span>
+        <h2 class="text-xl font-semibold text-white mb-4">Hex Preview (Scrabble)</h2>
+        <div id="hex-preview-content" class="log-view p-4" style="max-height:60vh; overflow:auto; background:#0d1117; color:#d1d5db;"></div>
+    </div>
+</div>
+
+<script>
+function previewHexFromForm() {
+    const startField = document.querySelector('input[name="start_offset"]');
+    const lengthField = document.querySelector('input[name="length"]');
+    let start = startField ? startField.value.trim() : '';
+    let length = lengthField ? lengthField.value.trim() : '';
+    if (!start || !length) {
+        alert('Please provide both Start Offset and Length to preview.');
+        return;
+    }
+    fetch('/manual_carve_hex', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+        body: `start_offset=${encodeURIComponent(start)}&length=${encodeURIComponent(length)}`
+    })
+    .then(r => r.json())
+    .then(data => {
+        if (data.error) {
+            alert('Error: ' + data.error);
+            return;
+        }
+        const container = document.getElementById('hex-preview-content');
+        container.innerHTML = data.html;
+        const modal = document.getElementById('hexPreviewModal');
+        modal.style.display = 'block';
+    }).catch(e => alert('Error fetching hex preview: ' + e));
+}
+
+document.getElementById('hexPreviewClose').addEventListener('click', function(){
+    document.getElementById('hexPreviewModal').style.display = 'none';
+});
+
+// Close modal when clicking outside content
+window.addEventListener('click', function(e){
+    const modal = document.getElementById('hexPreviewModal');
+    if (e.target === modal) modal.style.display = 'none';
+});
+</script>
+"""
+
+MANUAL_CARVING_EVIDENCE_HEX = """
+<div class="mt-8 card p-6 rounded-lg">
+    <h2 class="text-xl font-semibold text-white mb-4">View Evidence File Hex</h2>
+    <p class="text-sm text-gray-400 mb-4">Browse the uploaded evidence file in hex. Use Prev/Next to page through the file. Page size defaults to 64KB.</p>
+
+    <div class="grid grid-cols-3 gap-4 mb-4">
+        <div>
+            <label class="block text-sm font-medium text-gray-300">Start Offset (decimal or 0x hex)</label>
+            <input type="text" id="evidence-start" class="mt-1 block w-full bg-gray-800 border-gray-600 rounded-md shadow-sm p-2 text-white font-mono" placeholder="0x0 or 0" value="0">
+        </div>
+        <div>
+            <label class="block text-sm font-medium text-gray-300">Length (bytes)</label>
+            <input type="number" id="evidence-length" class="mt-1 block w-full bg-gray-800 border-gray-600 rounded-md shadow-sm p-2 text-white" value="65536">
+        </div>
+        <div class="flex items-end space-x-2">
+            <button id="evidence-view-btn" class="btn-primary py-2 px-4">View</button>
+            <button id="evidence-prev-btn" class="btn-secondary py-2 px-3">Prev</button>
+            <button id="evidence-next-btn" class="btn-secondary py-2 px-3">Next</button>
+        </div>
+    </div>
+
+    <div id="evidence-hex-view" class="hex-view p-3" style="background:#0b0f14; color:#d1d5db; max-height:50vh; overflow:auto;"></div>
+    <div id="evidence-hex-info" class="text-xs text-gray-400 mt-2"></div>
+</div>
+
+<script>
+(function(){
+    let currentOffset = 0;
+    const maxPreview = 65536;
+
+    function parseOffset(val) {
+        val = String(val).trim();
+        if (val.startsWith('0x') || val.startsWith('0X')) return parseInt(val, 16);
+        return parseInt(val, 10) || 0;
+    }
+
+    async function loadEvidenceHex(offset, length) {
+        const body = `start_offset=${encodeURIComponent(offset)}&length=${encodeURIComponent(length)}`;
+        const res = await fetch('/view_evidence_hex', {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body});
+        const data = await res.json();
+        if (data.error) {
+            document.getElementById('evidence-hex-view').innerText = 'Error: ' + data.error;
+            document.getElementById('evidence-hex-info').innerText = '';
+            return;
+        }
+        document.getElementById('evidence-hex-view').innerHTML = data.html;
+        currentOffset = data.start || offset;
+        const info = `Showing 0x${currentOffset.toString(16).toUpperCase()} - 0x${(currentOffset + data.length -1).toString(16).toUpperCase()} (${data.length} bytes) of ${data.file_size} bytes`;
+        document.getElementById('evidence-hex-info').innerText = info;
+        document.getElementById('evidence-start').value = '0x' + currentOffset.toString(16).toUpperCase();
+    }
+
+    document.getElementById('evidence-view-btn').addEventListener('click', function(){
+        const start = parseOffset(document.getElementById('evidence-start').value);
+        let length = parseInt(document.getElementById('evidence-length').value) || maxPreview;
+        length = Math.min(length, maxPreview);
+        loadEvidenceHex(start, length);
+    });
+
+    document.getElementById('evidence-prev-btn').addEventListener('click', function(){
+        let length = parseInt(document.getElementById('evidence-length').value) || maxPreview;
+        length = Math.min(length, maxPreview);
+        const newOffset = Math.max(0, currentOffset - length);
+        loadEvidenceHex(newOffset, length);
+    });
+
+    document.getElementById('evidence-next-btn').addEventListener('click', function(){
+        let length = parseInt(document.getElementById('evidence-length').value) || maxPreview;
+        length = Math.min(length, maxPreview);
+        const newOffset = currentOffset + length;
+        loadEvidenceHex(newOffset, length);
+    });
+
+    // Load initial view
+    loadEvidenceHex(0, 65536);
+})();
+</script>
+"""
+
+MANUAL_CARVING_EVIDENCE_HEX = """
+<div class="mt-8 card p-6 rounded-lg">
+    <h2 class="text-xl font-semibold text-white mb-4">View Evidence File Hex</h2>
+    <p class="text-sm text-gray-400 mb-4">Browse the uploaded evidence file in hex. Use Prev/Next to page through the file. Page size defaults to 64KB.</p>
+
+    <div class="grid grid-cols-3 gap-4 mb-4">
+        <div>
+            <label class="block text-sm font-medium text-gray-300">Start Offset (decimal or 0x hex)</label>
+            <input type="text" id="evidence-start" class="mt-1 block w-full bg-gray-800 border-gray-600 rounded-md shadow-sm p-2 text-white font-mono" placeholder="0x0 or 0" value="0">
+        </div>
+        <div>
+            <label class="block text-sm font-medium text-gray-300">Length (bytes)</label>
+            <input type="number" id="evidence-length" class="mt-1 block w-full bg-gray-800 border-gray-600 rounded-md shadow-sm p-2 text-white" value="65536">
+        </div>
+        <div class="flex items-end space-x-2">
+            <button id="evidence-view-btn" class="btn-primary py-2 px-4">View</button>
+            <button id="evidence-prev-btn" class="btn-secondary py-2 px-3">Prev</button>
+            <button id="evidence-next-btn" class="btn-secondary py-2 px-3">Next</button>
+        </div>
+    </div>
+
+    <div id="evidence-hex-view" class="hex-view p-3" style="background:#0b0f14; color:#d1d5db; max-height:50vh; overflow:auto;"></div>
+    <div id="evidence-hex-info" class="text-xs text-gray-400 mt-2"></div>
+</div>
+
+<script>
+(function(){
+    let currentOffset = 0;
+    const maxPreview = 65536;
+
+    function parseOffset(val) {
+        val = String(val).trim();
+        if (val.startsWith('0x') || val.startsWith('0X')) return parseInt(val, 16);
+        return parseInt(val, 10) || 0;
+    }
+
+    async function loadEvidenceHex(offset, length) {
+        const body = `start_offset=${encodeURIComponent(offset)}&length=${encodeURIComponent(length)}`;
+        const res = await fetch('/view_evidence_hex', {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body});
+        const data = await res.json();
+        if (data.error) {
+            document.getElementById('evidence-hex-view').innerText = 'Error: ' + data.error;
+            document.getElementById('evidence-hex-info').innerText = '';
+            return;
+        }
+        document.getElementById('evidence-hex-view').innerHTML = data.html;
+        currentOffset = data.start || offset;
+        const info = `Showing 0x${currentOffset.toString(16).toUpperCase()} - 0x${(currentOffset + data.length -1).toString(16).toUpperCase()} (${data.length} bytes) of ${data.file_size} bytes`;
+        document.getElementById('evidence-hex-info').innerText = info;
+        document.getElementById('evidence-start').value = '0x' + currentOffset.toString(16).toUpperCase();
+    }
+
+    document.getElementById('evidence-view-btn').addEventListener('click', function(){
+        const start = parseOffset(document.getElementById('evidence-start').value);
+        let length = parseInt(document.getElementById('evidence-length').value) || maxPreview;
+        length = Math.min(length, maxPreview);
+        loadEvidenceHex(start, length);
+    });
+
+    document.getElementById('evidence-prev-btn').addEventListener('click', function(){
+        let length = parseInt(document.getElementById('evidence-length').value) || maxPreview;
+        length = Math.min(length, maxPreview);
+        const newOffset = Math.max(0, currentOffset - length);
+        loadEvidenceHex(newOffset, length);
+    });
+
+    document.getElementById('evidence-next-btn').addEventListener('click', function(){
+        let length = parseInt(document.getElementById('evidence-length').value) || maxPreview;
+        length = Math.min(length, maxPreview);
+        const newOffset = currentOffset + length;
+        loadEvidenceHex(newOffset, length);
+    });
+
+    // Load initial view
+    loadEvidenceHex(0, 65536);
+})();
 </script>
 """
 
@@ -3584,7 +4604,7 @@ ENHANCED_DELETED_STATUS_TEMPLATE = """
             <div class="flex justify-between items-center mb-6">
                 <h2 class="text-xl font-semibold text-white">📁 Recovered Files</h2>
                 <div class="flex items-center space-x-3">
-                    <span class="bg-blue-600 text-white px-3 py-1 rounded-full text-sm font-medium">
+                    <span id="recovered-count" class="bg-blue-600 text-white px-3 py-1 rounded-full text-sm font-medium">
                         {{ recovered_files|length }} files recovered
                     </span>
                     {% if recovered_files %}
@@ -3601,6 +4621,7 @@ ENHANCED_DELETED_STATUS_TEMPLATE = """
                 </div>
             </div>
 
+            <div id="recovered-panel">
             {% if recovered_files %}
             <!-- Files Table -->
             <div class="overflow-x-auto">
@@ -3678,12 +4699,118 @@ ENHANCED_DELETED_STATUS_TEMPLATE = """
                 {% endif %}
             </div>
             {% endif %}
+            </div> <!-- /#recovered-panel -->
         </div>
     </div>
 </div>
 
-<!-- Enhanced JavaScript for Real-time Updates -->
 <script>
+// Small helper to escape HTML when inserting into innerHTML
+function escapeHtml(unsafe) {
+    if (!unsafe && unsafe !== 0) return '';
+    return String(unsafe)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#039;');
+}
+
+// Function to update the recovered files list
+function updateRecoveredFilesList() {
+    fetch('/get_recovered_files_list')
+        .then(response => response.json())
+        .then(data => {
+            const recoveredPanel = document.getElementById('recovered-panel');
+            const recoveredCountBadge = document.getElementById('recovered-count');
+            
+            if (!recoveredPanel) return;
+
+            if (data.success && data.files && Object.keys(data.files).length > 0) {
+                // Build the files table
+                let html = `
+                    <div class="overflow-x-auto">
+                        <table class="min-w-full bg-gray-800 rounded-lg overflow-hidden">
+                            <thead class="bg-gray-700">
+                                <tr>
+                                    <th class="text-left py-3 px-4 text-white font-semibold">ID</th>
+                                    <th class="text-left py-3 px-4 text-white font-semibold">Filename</th>
+                                    <th class="text-left py-3 px-4 text-white font-semibold">Size</th>
+                                    <th class="text-left py-3 px-4 text-white font-semibold">Type</th>
+                                    <th class="text-left py-3 px-4 text-white font-semibold">Recovery Method</th>
+                                    <th class="text-left py-3 px-4 text-white font-semibold">Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody>`;
+
+                Object.values(data.files).forEach((file, index) => {
+                    const id = index + 1;
+                    const name = escapeHtml(file.name || 'Unknown');
+                    const size_kb = file.size_kb || (file.size ? (Math.round((file.size/1024)*100)/100).toFixed(2) : '0');
+                    const file_type = escapeHtml(file.file_type || 'Unknown');
+                    const method = escapeHtml(file.recovery_method || 'Unknown');
+                    const mtime = escapeHtml(file.mtime || 'Unknown date');
+                    const thumb = file.thumbnail ? `<img src="${file.thumbnail}" class="w-8 h-8 object-cover rounded" alt="Thumbnail" onerror="this.style.display='none'">` : '';
+
+                    html += `
+                        <tr class="border-b border-gray-600 hover:bg-gray-750 transition-colors">
+                            <td class="py-3 px-4 text-gray-300 font-mono">${id}</td>
+                            <td class="py-3 px-4 text-gray-300">
+                                <div class="flex items-center space-x-3">
+                                    ${thumb}
+                                    <div>
+                                        <div class="font-medium">${name.length > 40 ? name.slice(0,37) + '...' : name}</div>
+                                        <div class="text-xs text-gray-500">${mtime}</div>
+                                    </div>
+                                </div>
+                            </td>
+                            <td class="py-3 px-4 text-gray-300 font-mono">${size_kb} KB</td>
+                            <td class="py-3 px-4 text-gray-300">
+                                <span class="px-2 py-1 bg-gray-600 rounded text-xs">${file_type}</span>
+                            </td>
+                            <td class="py-3 px-4 text-gray-300">
+                                <span class="px-2 py-1 bg-blue-600 rounded text-xs">${method}</span>
+                            </td>
+                            <td class="py-3 px-4">
+                                <div class="flex space-x-2">
+                                    <a href="/view_deleted_file/${encodeURIComponent(name)}" target="_blank" class="btn-secondary px-3 py-1 text-xs rounded hover:bg-gray-600 transition-colors">👁️ View</a>
+                                    <a href="/download_deleted_file/${encodeURIComponent(name)}" class="btn-primary px-3 py-1 text-xs rounded hover:bg-blue-700 transition-colors">📥 Download</a>
+                                    <a href="/hex_view_deleted/${encodeURIComponent(name)}" target="_blank" class="btn-green px-3 py-1 text-xs rounded hover:bg-green-700 transition-colors">🔢 Hex</a>
+                                </div>
+                            </td>
+                        </tr>`;
+                });
+
+                html += `</tbody></table></div>`;
+                recoveredPanel.innerHTML = html;
+                
+                // Update the count badge
+                if (recoveredCountBadge) {
+                    recoveredCountBadge.textContent = `${Object.keys(data.files).length} files recovered`;
+                }
+            } else {
+                // Show empty state
+                recoveredPanel.innerHTML = `
+                    <div class="text-center py-12 text-gray-500">
+                        <div class="mb-4">
+                            <svg class="w-16 h-16 mx-auto text-gray-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"></path>
+                            </svg>
+                        </div>
+                        <p class="text-lg mb-2">No deleted files recovered yet</p>
+                        <p class="text-sm text-gray-400 mb-6">Start the automatic recovery process to scan for deleted files using multiple forensic methods</p>
+                    </div>`;
+                
+                if (recoveredCountBadge) {
+                    recoveredCountBadge.textContent = `0 files recovered`;
+                }
+            }
+        })
+        .catch(error => {
+            console.error('Error fetching recovered files list:', error);
+        });
+}
+
 // Enhanced progress tracking with better error handling
 function updateRecoveryProgress() {
     fetch('/deleted_scan_status')
@@ -3694,25 +4821,46 @@ function updateRecoveryProgress() {
         .then(data => {
             console.log('Recovery status update:', data);
             
-            // Update validation statistics
+            // Update validation statistics (guard element presence)
             if (data.validation_stats) {
-                document.getElementById('total-scanned').textContent = data.validation_stats.total_scanned || 0;
-                document.getElementById('empty-rejected').textContent = data.validation_stats.empty_rejected || 0;
-                document.getElementById('duplicate-rejected').textContent = data.validation_stats.duplicate_rejected || 0;
-                document.getElementById('invalid-rejected').textContent = data.validation_stats.invalid_rejected || 0;
-                document.getElementById('valid-recovered').textContent = data.validation_stats.valid_recovered || 0;
+                const totalScannedEl = document.getElementById('total-scanned');
+                const emptyRejectedEl = document.getElementById('empty-rejected');
+                const duplicateRejectedEl = document.getElementById('duplicate-rejected');
+                const invalidRejectedEl = document.getElementById('invalid-rejected');
+                const validRecoveredEl = document.getElementById('valid-recovered');
+
+                if (totalScannedEl) totalScannedEl.textContent = data.validation_stats.total_scanned || 0;
+                if (emptyRejectedEl) emptyRejectedEl.textContent = data.validation_stats.empty_rejected || 0;
+                if (duplicateRejectedEl) duplicateRejectedEl.textContent = data.validation_stats.duplicate_rejected || 0;
+                if (invalidRejectedEl) invalidRejectedEl.textContent = data.validation_stats.invalid_rejected || 0;
+                if (validRecoveredEl) validRecoveredEl.textContent = data.validation_stats.valid_recovered || 0;
             }
             
             // Update timing information
-            if (data.elapsed_time) {
-                document.getElementById('elapsed-time').textContent = data.elapsed_time;
+            const elapsedTimeEl = document.getElementById('elapsed-time');
+            const timeRemainingEl = document.getElementById('time-remaining');
+            const totalEstimatedEl = document.getElementById('total-estimated');
+            
+            function formatTimeSeconds(secs) {
+                if (secs < 1) return '0s';
+                const h = Math.floor(secs / 3600);
+                const m = Math.floor((secs % 3600) / 60);
+                const s = Math.floor(secs % 60);
+                if (h > 0) return `${h}h ${m}m ${s}s`;
+                if (m > 0) return `${m}m ${s}s`;
+                return `${s}s`;
             }
-            if (data.time_remaining_str) {
-                document.getElementById('time-remaining').textContent = data.time_remaining_str;
+
+            if (elapsedTimeEl) {
+                if (data.elapsed_time && data.elapsed_time !== '0s') {
+                    elapsedTimeEl.textContent = data.elapsed_time;
+                } else if (data.start_time) {
+                    const elapsedSecs = Math.max(0, Math.floor(Date.now()/1000 - data.start_time));
+                    elapsedTimeEl.textContent = formatTimeSeconds(elapsedSecs);
+                }
             }
-            if (data.estimated_total_time) {
-                document.getElementById('total-estimated').textContent = data.estimated_total_time;
-            }
+            if (data.time_remaining_str && timeRemainingEl) timeRemainingEl.textContent = data.time_remaining_str;
+            if (data.estimated_total_time && totalEstimatedEl) totalEstimatedEl.textContent = data.estimated_total_time;
             
             // Update progress bar
             const progressBar = document.getElementById('progress-bar');
@@ -3724,51 +4872,64 @@ function updateRecoveryProgress() {
                 const completedMethods = Object.values(data.scan_methods || {}).filter(val => val > 0).length;
                 const progress = Math.min(95, (completedMethods / totalMethods) * 100); // Cap at 95% until complete
                 
-                progressBar.style.width = progress + '%';
-                progressPercent.textContent = Math.round(progress) + '%';
-                progressBar.className = 'bg-blue-600 h-3 rounded-full transition-all duration-500';
+                if (progressBar) {
+                    progressBar.style.width = progress + '%';
+                    progressBar.className = 'bg-blue-600 h-3 rounded-full transition-all duration-500';
+                }
+                if (progressPercent) progressPercent.textContent = Math.round(progress) + '%';
             }
             
             // Update method counters
             if (data.scan_methods) {
-                document.getElementById('method-dir').textContent = data.scan_methods.directory_walk || 0;
-                document.getElementById('method-inode').textContent = data.scan_methods.inode_scan || 0;
-                document.getElementById('method-slack').textContent = data.scan_methods.file_slack || 0;
-                document.getElementById('method-recycle').textContent = data.scan_methods.recycle_bin || 0;
+                const methodDirEl = document.getElementById('method-dir');
+                const methodInodeEl = document.getElementById('method-inode');
+                const methodSlackEl = document.getElementById('method-slack');
+                const methodRecycleEl = document.getElementById('method-recycle');
+
+                if (methodDirEl) methodDirEl.textContent = data.scan_methods.directory_walk || 0;
+                if (methodInodeEl) methodInodeEl.textContent = data.scan_methods.inode_scan || 0;
+                if (methodSlackEl) methodSlackEl.textContent = data.scan_methods.file_slack || 0;
+                if (methodRecycleEl) methodRecycleEl.textContent = data.scan_methods.recycle_bin || 0;
             }
             
             // Update status message
             const statusText = document.getElementById('status-text');
             const statusMessage = document.getElementById('status-message');
-            
-            if (data.message) {
-                statusText.textContent = data.message;
+
+            if (statusText && statusMessage) {
+                if (data.message) {
+                    statusText.textContent = data.message;
+                }
+                
+                if (data.in_progress) {
+                    statusMessage.className = 'mt-4 p-3 rounded-lg text-sm bg-blue-900 text-blue-200 border border-blue-700';
+                } else if (data.error) {
+                    statusMessage.className = 'mt-4 p-3 rounded-lg text-sm bg-red-900 text-red-200 border border-red-700';
+                    statusText.textContent = 'Error: ' + (data.error || 'Unknown error occurred');
+                } else if (data.complete) {
+                    statusMessage.className = 'mt-4 p-3 rounded-lg text-sm bg-green-900 text-green-200 border border-green-700';
+                }
             }
             
-            if (data.in_progress) {
-                statusMessage.className = 'mt-4 p-3 rounded-lg text-sm bg-blue-900 text-blue-200 border border-blue-700';
-                // Continue polling
+            // CRITICAL: Update the recovered files list in real-time
+            updateRecoveredFilesList();
+
+            // Continue polling if still in progress
+            if (data.in_progress && !data.complete) {
                 setTimeout(updateRecoveryProgress, 2000);
             } else if (data.complete) {
-                progressBar.style.width = '100%';
-                progressBar.className = 'bg-green-600 h-3 rounded-full transition-all duration-500';
-                progressPercent.textContent = '100%';
-                statusMessage.className = 'mt-4 p-3 rounded-lg text-sm bg-green-900 text-green-200 border border-green-700';
-                
-                // Refresh page to show results after completion
-                if (data.files_found > 0) {
-                    setTimeout(() => {
-                        window.location.reload();
-                    }, 3000);
-                }
-            } else if (data.error) {
-                statusMessage.className = 'mt-4 p-3 rounded-lg text-sm bg-red-900 text-red-200 border border-red-700';
-                statusText.textContent = 'Error: ' + (data.error || 'Unknown error occurred');
+                // Final update when complete
+                if (progressBar) progressBar.style.width = '100%';
+                if (progressPercent) progressPercent.textContent = '100%';
+                console.log('Recovery process completed');
             }
         })
         .catch(error => {
             console.error('Error fetching recovery status:', error);
-            document.getElementById('status-text').textContent = 'Error connecting to server: ' + error.message;
+            const statusText = document.getElementById('status-text');
+            if (statusText) {
+                statusText.textContent = 'Error connecting to server: ' + error.message;
+            }
             // Retry after 5 seconds on error
             setTimeout(updateRecoveryProgress, 5000);
         });
@@ -3776,6 +4937,9 @@ function updateRecoveryProgress() {
 
 // Start polling if recovery is in progress
 document.addEventListener('DOMContentLoaded', function() {
+    // Always update the files list on page load
+    updateRecoveredFilesList();
+    
     {% if deleted_scan_status.in_progress %}
     console.log('Starting recovery progress monitoring...');
     updateRecoveryProgress();
@@ -3791,6 +4955,11 @@ document.addEventListener('DOMContentLoaded', function() {
             button.innerHTML = '🔄 Starting...';
             button.classList.add('opacity-50', 'cursor-not-allowed');
             
+            // Start polling immediately when user clicks start
+            setTimeout(() => {
+                updateRecoveryProgress();
+            }, 1000);
+            
             // Revert after 3 seconds if still on same page
             setTimeout(() => {
                 if (button.innerHTML === '🔄 Starting...') {
@@ -3801,6 +4970,7 @@ document.addEventListener('DOMContentLoaded', function() {
         });
     }
 });
+        
 </script>
 """
 REPORTING_PAGE_CONTENT = """
@@ -3828,9 +4998,40 @@ REPORTING_PAGE_CONTENT = """
             </div>
         </div>
         
+        <div class="pt-4">
+            <label class="block text-sm font-medium text-gray-300">Report Scope</label>
+            <div class="mt-2 grid grid-cols-1 md:grid-cols-3 gap-4 text-sm text-gray-300">
+                <div>
+                    <label class="inline-flex items-center">
+                        <input type="checkbox" name="include_carved" value="1" checked class="form-checkbox">
+                        <span class="ml-2">Include Carved Files</span>
+                    </label>
+                </div>
+                <div>
+                    <label class="inline-flex items-center">
+                        <input type="checkbox" name="include_deleted" value="1" checked class="form-checkbox">
+                        <span class="ml-2">Include Deleted Files</span>
+                    </label>
+                </div>
+                <div>
+                    <label class="block text-sm font-medium text-gray-400">File Categories (select any)</label>
+                    <div class="mt-2 grid grid-cols-2 gap-2 text-xs text-gray-300">
+                        <label class="inline-flex items-center"><input type="checkbox" name="file_category" value="images" checked class="form-checkbox"><span class="ml-2">Images</span></label>
+                        <label class="inline-flex items-center"><input type="checkbox" name="file_category" value="documents" checked class="form-checkbox"><span class="ml-2">Documents</span></label>
+                        <label class="inline-flex items-center"><input type="checkbox" name="file_category" value="archives" checked class="form-checkbox"><span class="ml-2">Archives</span></label>
+                        <label class="inline-flex items-center"><input type="checkbox" name="file_category" value="media" checked class="form-checkbox"><span class="ml-2">Audio/Video</span></label>
+                        <label class="inline-flex items-center"><input type="checkbox" name="file_category" value="executables" checked class="form-checkbox"><span class="ml-2">Executables</span></label>
+                        <label class="inline-flex items-center"><input type="checkbox" name="file_category" value="other" checked class="form-checkbox"><span class="ml-2">Other</span></label>
+                    </div>
+                    <div class="mt-2 text-xs text-gray-400">Or add custom extensions (comma separated, e.g. <code>doc,log,dat</code>)</div>
+                    <input type="text" name="custom_exts" placeholder="e.g. doc,log,dat" class="mt-1 block w-full bg-gray-800 border-gray-600 rounded-md shadow-sm p-2 text-white text-xs">
+                </div>
+            </div>
+        </div>
+        
         <div>
             <label class="block text-sm font-medium text-gray-300">Report Format</label>
-            <div class="mt-2 grid grid-cols-2 md:grid-cols-4 gap-4">
+            <div id="report-format-options" class="mt-2 grid grid-cols-2 md:grid-cols-4 gap-4">
                 <label class="relative flex cursor-pointer rounded-lg border bg-gray-800 p-4 focus:outline-none">
                     <input type="radio" name="report_format" value="html" class="sr-only" checked>
                     <span class="flex flex-1">
@@ -3890,6 +5091,49 @@ REPORTING_PAGE_CONTENT = """
         </div>
     </form>
 </div>
+
+<script>
+// Make the report-format tiles visually reflect the single selected radio
+document.addEventListener('DOMContentLoaded', function() {
+    try {
+        const container = document.getElementById('report-format-options');
+        if (!container) return;
+        const labels = Array.from(container.querySelectorAll('label'));
+
+        function clearSelection() {
+            labels.forEach(l => l.classList.remove('selected', 'ring-2', 'ring-blue-500'));
+        }
+
+        function updateFromRadios() {
+            clearSelection();
+            labels.forEach(l => {
+                const inp = l.querySelector('input[type="radio"]');
+                if (inp && inp.checked) {
+                    l.classList.add('selected', 'ring-2', 'ring-blue-500');
+                }
+            });
+        }
+
+        labels.forEach(l => {
+            const inp = l.querySelector('input[type="radio"]');
+            if (!inp) return;
+            // Click on the tile selects the radio and updates visuals
+            l.addEventListener('click', function(e) {
+                // Allow the input to be checked by default behavior
+                inp.checked = true;
+                updateFromRadios();
+            });
+            // Also react to keyboard changes
+            inp.addEventListener('change', updateFromRadios);
+        });
+
+        // initialize
+        updateFromRadios();
+    } catch (err) {
+        console.error('Report format selector init failed', err);
+    }
+});
+</script>
 
 <div class="card p-6 rounded-lg mt-8">
     <h2 class="text-xl font-semibold text-white mb-4">Report Contents</h2>
@@ -4237,6 +5481,108 @@ document.addEventListener('DOMContentLoaded', function() {
 });
 </script>
 """
+DATABASE_VIEW_CONTENT = """
+<h1 class="text-3xl font-bold text-white mb-4">Database & File Inspector</h1>
+<p class="text-gray-400 mb-6">View and manage evidence files stored in the database and recovered files on disk.</p>
+<div class="flex justify-end mb-4">
+    <a href="{{ url_for('database_view') }}" class="btn-primary px-4 py-2 rounded-lg">Refresh Page</a>
+</div>
+
+<div class="card p-6 rounded-lg mb-8">
+    <h2 class="text-xl font-semibold text-white mb-4">Evidence Files in Database</h2>
+    {% if db_files %}
+    <div class="overflow-x-auto">
+        <table class="w-full text-left">
+            <thead>
+                <tr class="border-b border-gray-700">
+                    <th class="p-2">Filename</th>
+                    <th class="p-2">Size</th>
+                    <th class="p-2">Upload Date</th>
+                    <th class="p-2">Actions</th>
+                </tr>
+            </thead>
+            <tbody>
+            {% for db_file in db_files %}
+                <tr class="border-b border-gray-700 hover:bg-gray-800">
+                    <td class="p-2 font-mono">{{ db_file.filename }}</td>
+                    <td class="p-2 font-mono">{{ "%.2f MB"|format(db_file.filesize / (1024*1024)) }}</td>
+                    <td class="p-2">{{ db_file.upload_date.strftime('%Y-%m-%d %H:%M') }}</td>
+                    <td class="p-2 flex space-x-2">
+                        <a href="{{ url_for('load_evidence', file_id=db_file.id) }}" class="btn-secondary px-3 py-1 text-xs rounded-lg">Load & Analyze</a>
+                        <a href="{{ url_for('remove_from_db', file_id=db_file.id) }}" onclick="return confirm('Are you sure you want to permanently delete this file from the database AND disk?');" class="bg-red-600 text-white px-3 py-1 text-xs rounded-lg">Delete</a>
+                    </td>
+                </tr>
+            {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    {% else %}
+        <p class="text-gray-500">No evidence files found in the database or database is not enabled.</p>
+    {% endif %}
+</div>
+
+<div class="card p-6 rounded-lg mb-8">
+    <h2 class="text-xl font-semibold text-white mb-4">Carved Files on Disk</h2>
+    {% if carved_disk_files %}
+    <div class="overflow-x-auto">
+        <table class="w-full text-left">
+            <thead>
+                <tr class="border-b border-gray-700">
+                    <th class="p-2">Filename</th>
+                    <th class="p-2">Size</th>
+                    <th class="p-2">Actions</th>
+                </tr>
+            </thead>
+            <tbody>
+            {% for file in carved_disk_files %}
+                <tr class="border-b border-gray-700 hover:bg-gray-800">
+                    <td class="p-2 font-mono">{{ file.name }}</td>
+                    <td class="p-2 font-mono">{{ file.size }}</td>
+                    <td class="p-2 flex space-x-2">
+                        <a href="{{ url_for('view_carved_file', filename=file.name) }}" target="_blank" class="btn-secondary px-3 py-1 text-xs rounded-lg">View</a>
+                        <a href="{{ url_for('delete_disk_file', folder='carved', filename=file.name) }}" onclick="return confirm('Permanently delete this carved file from disk?');" class="bg-red-600 text-white px-3 py-1 text-xs rounded-lg">Delete</a>
+                    </td>
+                </tr>
+            {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    {% else %}
+        <p class="text-gray-500">No carved files found in the '{{ carved_folder_path }}' directory.</p>
+    {% endif %}
+</div>
+
+<div class="card p-6 rounded-lg">
+    <h2 class="text-xl font-semibold text-white mb-4">Recovered Deleted Files on Disk</h2>
+    {% if deleted_disk_files %}
+    <div class="overflow-x-auto">
+        <table class="w-full text-left">
+            <thead>
+                <tr class="border-b border-gray-700">
+                    <th class="p-2">Filename</th>
+                    <th class="p-2">Size</th>
+                    <th class="p-2">Actions</th>
+                </tr>
+            </thead>
+            <tbody>
+            {% for file in deleted_disk_files %}
+                <tr class="border-b border-gray-700 hover:bg-gray-800">
+                    <td class="p-2 font-mono">{{ file.name }}</td>
+                    <td class="p-2 font-mono">{{ file.size }}</td>
+                    <td class="p-2 flex space-x-2">
+                        <a href="{{ url_for('view_deleted_file', filename=file.name) }}" target="_blank" class="btn-secondary px-3 py-1 text-xs rounded-lg">View</a>
+                        <a href="{{ url_for('delete_disk_file', folder='deleted_recovered', filename=file.name) }}" onclick="return confirm('Permanently delete this recovered file from disk?');" class="bg-red-600 text-white px-3 py-1 text-xs rounded-lg">Delete</a>
+                    </td>
+                </tr>
+            {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    {% else %}
+        <p class="text-gray-500">No recovered files found in the '{{ deleted_folder_path }}' directory.</p>
+    {% endif %}
+</div>
+"""
 
 DELETED_FILES_CONTENT = """
 <h1 class="text-3xl font-bold text-white mb-4">Recovered Deleted Files</h1>
@@ -4311,8 +5657,8 @@ def get_active_evidence_path():
 
 def _clear_all_session_data():
     """Clears all in-memory data and temporary result files."""
-    # global , deleted_scan_status, decryption_status, hashing_status, strings_status, uploaded_files_db, deleted_files_db, sorted_deleted_inodes
-    carving_status,
+    global carving_status , deleted_scan_status, decryption_status, hashing_status, strings_status, uploaded_files_db, deleted_files_db, sorted_deleted_inodes
+    
     
     uploaded_files_db.clear()
     deleted_files_db.clear()
@@ -4346,7 +5692,13 @@ def _clear_all_session_data():
                 file_path = os.path.join(carved_dir, filename)
                 if os.path.isfile(file_path):
                     os.unlink(file_path)
-            print(f"Cleared carved files directory: {carved_dir}")
+            # Sanitize path to remove any trailing CR/LF from config values before logging
+            safe_carved_dir = carved_dir.rstrip('\r\n') if isinstance(carved_dir, str) else carved_dir
+            try:
+                app.logger.info(f"Cleared carved files directory: {safe_carved_dir}")
+            except Exception:
+                # Fallback to print if logger is not available in this context
+                print(f"Cleared carved files directory: {safe_carved_dir}")
     except Exception as e:
         print(f"Error clearing carved files directory: {e}")
     
@@ -4358,7 +5710,13 @@ def _clear_all_session_data():
                 file_path = os.path.join(deleted_recovery_dir, filename)
                 if os.path.isfile(file_path):
                     os.unlink(file_path)
-            print(f"Cleared deleted recovery directory: {deleted_recovery_dir}")
+            # Sanitize path to remove any trailing CR/LF from config values before logging
+            safe_deleted_dir = deleted_recovery_dir.rstrip('\r\n') if isinstance(deleted_recovery_dir, str) else deleted_recovery_dir
+            try:
+                app.logger.info(f"Cleared deleted recovery directory: {safe_deleted_dir}")
+            except Exception:
+                # Fallback to print if logger is not available in this context
+                print(f"Cleared deleted recovery directory: {safe_deleted_dir}")
     except Exception as e:
         print(f"Error clearing deleted recovery directory: {e}")
     
@@ -4467,20 +5825,39 @@ def _generate_preview_response(content, filename, data_url, file_info=None):
 
 def _load_file_into_session(filename, filepath):
     """Loads file metadata into the session and starts background analysis."""
+    # Defensive: ensure the file exists before processing
+    if not filepath or not os.path.exists(filepath):
+        try:
+            flash(f"Evidence file not found on disk: {filepath}", "error")
+        except Exception:
+            pass
+        return None
+
     encryption_info = detect_encryption(filepath)
     forensic_results, partition_info = perform_forensic_analysis(filepath)
 
+    try:
+        size_mb = f"{os.path.getsize(filepath) / (1024*1024):.2f}"
+    except Exception:
+        size_mb = "0.00"
+
     uploaded_files_db[filename] = {
-        "path": filepath, "size_mb": f"{os.path.getsize(filepath) / (1024*1024):.2f}",
+        "path": filepath,
+        "size_mb": size_mb,
         "encryption_status": {
-            "encrypted": encryption_info.get('encrypted'), "encryption_type": encryption_info.get('encryption_type'),
-            "description": encryption_info.get('description'), "decrypting": False, "decrypted_path": None
+            "encrypted": encryption_info.get('encrypted'),
+            "encryption_type": encryption_info.get('encryption_type'),
+            "description": encryption_info.get('description'),
+            "decrypting": False,
+            "decrypted_path": None
         },
-        "forensic_results": forensic_results, "partition_info": partition_info,
-        "hash_info": {}, "hashing_complete": False
+        "forensic_results": forensic_results,
+        "partition_info": partition_info,
+        "hash_info": {},
+        "hashing_complete": False
     }
     threading.Thread(target=calculate_hashes_threaded, args=(filepath,)).start()
-    return encryption_info['encrypted']
+    return encryption_info.get('encrypted')
 
 def determine_recovery_method(filename):
     """Determine recovery method from filename pattern."""
@@ -4501,13 +5878,18 @@ def determine_recovery_method(filename):
 # --- STRICT AUTOMATIC DELETED FILES RECOVERY ---
 def strict_deleted_files_recovery_engine(filepath):
     """Autopsy-like automatic deleted files recovery with strict validation."""
-    # global deleted_scan_status
+    global deleted_scan_status
     
     deleted_scan_status.update({
         "in_progress": True, 
         "complete": False, 
         "files_found": 0, 
         "message": "Starting strict automatic recovery...",
+        "start_time": time.time(),
+        "last_update_time": time.time(),
+        "elapsed_time": "0s",
+        "estimated_total_time": None,
+        "time_remaining_str": "Calculating...",
         "scan_methods": {
             "directory_walk": 0,
             "inode_scan": 0,
@@ -4545,6 +5927,7 @@ def strict_deleted_files_recovery_engine(filepath):
     def validate_and_save_file(content, original_name, recovery_method, fs_object=None):
         """STRICT validation: Check file size, content, and duplicates before saving."""
         nonlocal total_recovered, seen_hashes
+        global deleted_files_db
         
         deleted_scan_status["validation_stats"]["total_scanned"] += 1
         
@@ -4571,20 +5954,118 @@ def strict_deleted_files_recovery_engine(filepath):
         
         # 5. All checks passed - save the file
         try:
-            # Generate unique filename with metadata
-            safe_filename = generate_recovery_filename(
-                original_name, recovery_method, total_recovered + 1, fs_object
-            )
+            # Try to detect a sensible extension from the recovered content
+            detected_ext = ''
+            try:
+                mime_type = magic.from_buffer(content[:8192], mime=True)
+                if mime_type:
+                    guessed = mimetypes.guess_extension(mime_type)
+                    if guessed:
+                        detected_ext = guessed
+            except Exception:
+                detected_ext = ''
+
+            # Fallback: check FILE_SIGNATURES for a header-based extension
+            if not detected_ext:
+                try:
+                    for _cat, types in FILE_SIGNATURES.items():
+                        for _name, sig in types.items():
+                            hdr = sig.get('header') or sig.get('headers')
+                            if not hdr:
+                                continue
+                            # support list of headers
+                            if isinstance(hdr, list):
+                                for h in hdr:
+                                    if content.startswith(h):
+                                        detected_ext = sig.get('extension', '')
+                                        break
+                                if detected_ext:
+                                    break
+                            else:
+                                if content.startswith(hdr):
+                                    detected_ext = sig.get('extension', '')
+                                    break
+                        if detected_ext:
+                            break
+                except Exception:
+                    detected_ext = ''
+
+            # Generate a sequential standardized deleted filename and include detected extension
+            seq = sum(1 for _ in os.listdir(recovery_dir) if os.path.isfile(os.path.join(recovery_dir, _))) + 1
+            safe_filename = generate_deleted_filename(seq, detected_ext)
             save_path = os.path.join(recovery_dir, safe_filename)
-            
+
+            # Ensure unique filename to avoid accidental overwrites when multiple
+            # recovered files are saved concurrently. Append a numeric suffix
+            # if the computed filename already exists.
+            if os.path.exists(save_path):
+                base_name, base_ext = os.path.splitext(safe_filename)
+                counter = 1
+                while True:
+                    candidate = f"{base_name}_{counter}{base_ext}"
+                    candidate_path = os.path.join(recovery_dir, candidate)
+                    if not os.path.exists(candidate_path):
+                        save_path = candidate_path
+                        break
+                    counter += 1
+
             with open(save_path, 'wb') as out_file:
                 out_file.write(content)
             
             # Add to seen hashes to prevent duplicates
             seen_hashes.add(content_hash)
-            total_recovered += 1
+            # Note: do not increment total_recovered here; update_recovery_status
+            # is responsible for incrementing the overall recovered counter to
+            # avoid double-counting when that function is called after
+            # successful validation.
             deleted_scan_status["validation_stats"]["valid_recovered"] += 1
-            
+            # Register the recovered file in the in-memory DB so the UI can show it
+            try:
+                mime_type = 'application/octet-stream'
+                try:
+                    mime_type = magic.from_file(save_path, mime=True)
+                except Exception:
+                    pass
+
+                file_size = os.path.getsize(save_path)
+                thumb = None
+                if mime_type and mime_type.startswith('image/'):
+                    thumb = create_thumbnail_data_uri(save_path)
+
+                file_type = 'Unknown'
+                if mime_type:
+                    if mime_type.startswith('image/'):
+                        file_type = 'Image'
+                    elif mime_type.startswith('video/'):
+                        file_type = 'Video'
+                    elif mime_type.startswith('audio/'):
+                        file_type = 'Audio'
+                    elif mime_type.startswith('text/'):
+                        file_type = 'Text'
+                    elif 'pdf' in mime_type:
+                        file_type = 'PDF'
+                    elif 'zip' in mime_type or 'archive' in mime_type:
+                        file_type = 'Archive'
+
+                mtime = None
+                try:
+                    mtime = datetime.datetime.fromtimestamp(os.path.getmtime(save_path)).strftime('%Y-%m-%d %H:%M:%S')
+                except Exception:
+                    mtime = None
+
+                deleted_files_db[os.path.basename(save_path)] = {
+                    'id': total_recovered + 1,
+                    'name': os.path.basename(save_path),
+                    'size_kb': f"{file_size/1024:.2f}",
+                    'file_type': file_type,
+                    'thumbnail': thumb,
+                    'recovery_method': recovery_method,
+                    'mtime': mtime,
+                    'path': save_path
+                }
+            except Exception:
+                pass
+
             return True
         except Exception as e:
             print(f"Error saving recovered file: {e}")
@@ -4624,10 +6105,17 @@ def strict_deleted_files_recovery_engine(filepath):
         except Exception:
             return False
 
-    def generate_recovery_filename(original_name, recovery_method, file_id, fs_object=None):
+    def generate_recovery_filename(original_name, recovery_method, file_id, fs_object=None, detected_ext=''):
         """Generate informative filename for recovered files."""
         # Clean the original filename
         clean_name = re.sub(r'[^\w\.-]', '_', original_name)
+        # Preserve extension if present
+        base, cur_ext = os.path.splitext(clean_name)
+        if cur_ext:
+            ext = cur_ext
+        else:
+            # if caller supplied a detected extension prefer that
+            ext = detected_ext or ''
         
         # Add metadata
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -4638,7 +6126,7 @@ def strict_deleted_files_recovery_engine(filepath):
         else:
             inode = "i0000"
         
-        return f"rec_{file_id:04d}_{method_abbr}_{inode}_{clean_name}"
+        return f"rec_{file_id:04d}_{method_abbr}_{inode}_{base}{ext}"
 
     def update_recovery_status(method, validated=True):
         """Update recovery status with validation info."""
@@ -4805,6 +6293,11 @@ def start_strict_deleted_recovery():
         "complete": False, 
         "files_found": 0, 
         "message": "Starting strict automatic recovery...",
+        "start_time": time.time(),
+        "last_update_time": time.time(),
+        "elapsed_time": "0s",
+        "estimated_total_time": None,
+        "time_remaining_str": "Calculating...",
         "scan_methods": {
             "directory_walk": 0,
             "inode_scan": 0,
@@ -4830,7 +6323,16 @@ def start_strict_deleted_recovery():
                 os.unlink(item_path)
     except Exception as e:
         flash(f"Error clearing old files: {e}", "warning")
-    
+    # Also clear the in-memory DB of recovered files to avoid stale entries
+    global deleted_files_db
+    try:
+        deleted_files_db = {}
+    except Exception:
+        # Fallback: clear in place if possible
+        try:
+            deleted_files_db.clear()
+        except Exception:
+            pass
     # Start the strict recovery in a background thread
     threading.Thread(target=strict_deleted_files_recovery_engine, args=(filepath,)).start()
     
@@ -4843,8 +6345,8 @@ def index():
     return redirect(url_for('evidence_upload'))
 
 @app.route('/upload_status')
-def upload_status_endpoint():
-    """Get current upload status with timing information."""
+def upload_status_api():
+    """API endpoint to get current upload status"""
     return jsonify(upload_status)
 
 @app.route('/carving_status')
@@ -4852,7 +6354,74 @@ def carving_status_endpoint():
     """Get current carving status with timing information."""
     return jsonify(carving_status)
 
-
+@app.route('/upload', methods=['POST'])
+def upload_file():
+    try:
+        if 'file' not in request.files:
+            return jsonify({'error': 'No file part'}), 400
+        
+        file = request.files['file']
+        if file.filename == '':
+            return jsonify({'error': 'No selected file'}), 400
+        
+        # Secure the filename
+        filename = secure_filename(file.filename)
+        filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        
+        # Initialize upload status
+        upload_status.update({
+            "in_progress": True,
+            "progress": 0,
+            "filename": filename,
+            "start_time": time.time(),
+            "estimated_total_time": None,
+            "elapsed_time": "0s",
+            "time_remaining_str": "Calculating...",
+            "total_bytes": 0,
+            "bytes_uploaded": 0,
+            "upload_speed": 0
+        })
+        
+        # Save file in chunks to handle large files
+        chunk_size = 16 * 1024 * 1024  # 16MB chunks
+        total_size = 0
+        
+        with open(filepath, 'wb') as f:
+            while True:
+                chunk = file.stream.read(chunk_size)
+                if not chunk:
+                    break
+                f.write(chunk)
+                total_size += len(chunk)
+                
+                # Update upload status
+                upload_status['bytes_uploaded'] = total_size
+                upload_status['total_bytes'] = total_size  # We don't know total in advance
+                upload_status['progress'] = 50  # Show progress as we're reading
+                
+                # Calculate timing
+                elapsed = time.time() - upload_status['start_time']
+                if elapsed > 0:
+                    upload_speed = total_size / elapsed
+                    upload_status['upload_speed'] = upload_speed
+                    upload_status['elapsed_time'] = format_time(elapsed)
+        
+        # Finalize upload status
+        upload_status.update({
+            "in_progress": False,
+            "progress": 100,
+            "complete": True,
+            "elapsed_time": format_time(time.time() - upload_status['start_time'])
+        })
+        
+        return jsonify({'message': 'File uploaded successfully', 'filename': filename}), 200
+        
+    except Exception as e:
+        upload_status.update({
+            "in_progress": False,
+            "error": str(e)
+        })
+        return jsonify({'error': f'Upload failed: {str(e)}'}), 500
 
 @app.route('/all_process_status')
 def all_process_status():
@@ -4865,6 +6434,14 @@ def all_process_status():
         "hashing": hashing_status,
         "strings": strings_status
     })
+
+@app.errorhandler(413)
+def too_large(e):
+    return jsonify({'error': 'File too large'}), 413
+
+@app.errorhandler(500)
+def internal_error(e):
+    return jsonify({'error': 'Internal server error during file upload'}), 500
 
 @app.route('/deleted_recovery')
 def deleted_recovery():
@@ -4911,160 +6488,408 @@ def start_deleted_recovery():
     
     return redirect(url_for('deleted_files_status_page'))
 
-# --- FIX: ADDED THE MISSING evidence_upload ROUTE ---
+@app.route('/', methods=['GET', 'POST'])
 @app.route('/evidence_upload', methods=['GET', 'POST'])
 def evidence_upload():
-    if request.method == 'POST':
-        if 'file' not in request.files:
-            flash('No file part', 'error')
-            return redirect(request.url)
-        file = request.files['file']
-        if file.filename == '':
-            flash('No selected file', 'error')
-            return redirect(request.url)
-        
-        if file:
-            # Initialize upload timing
-            upload_status.update({
-                "in_progress": True,
-                "filename": file.filename,
-                "start_time": time.time(),
-                "last_update_time": time.time(),
-                "progress": 0,
-                "bytes_uploaded": 0,
-                "total_bytes": 0,
-                "elapsed_time": "0s",
-                "time_remaining_str": "Calculating..."
-            })
-            
-            # Clear previous session data
-            _clear_all_session_data()
-            
-            filename = secure_filename(file.filename)
-            filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-            
-            if os.path.exists(filepath):
-                flash(f"A file named '{filename}' already exists on disk. Please remove it or rename the new file.", 'error')
-                upload_status["in_progress"] = False
-                return redirect(url_for('evidence_upload'))
-
-            if db and EvidenceFile.query.filter_by(filename=filename).first():
-                flash(f"A file named '{filename}' already exists in the database. Please remove it or rename the new file.", 'error')
-                upload_status["in_progress"] = False
-                return redirect(url_for('evidence_upload'))
-
-            # Get file size for progress tracking
-            file.seek(0, 2)  # Seek to end to get size
-            file_size = file.tell()
-            file.seek(0)  # Reset to beginning
-            upload_status["total_bytes"] = file_size
-            
-            # Save file with progress tracking
-            bytes_written = 0
-            chunk_size = 64 * 1024  # 64KB chunks
-            
-            with open(filepath, 'wb') as f:
-                while True:
-                    chunk = file.read(chunk_size)
-                    if not chunk:
-                        break
-                    f.write(chunk)
-                    bytes_written += len(chunk)
-                    
-                    # Update upload progress
-                    upload_status["bytes_uploaded"] = bytes_written
-                    upload_status["progress"] = (bytes_written / file_size) * 100
-                    
-                    # Update timing every second
-                    if time.time() - upload_status["last_update_time"] >= 1:
-                        elapsed, remaining, total_est = calculate_upload_time_estimations(
-                            bytes_written, file_size, upload_status["start_time"]
-                        )
-                        upload_status["elapsed_time"] = elapsed
-                        upload_status["time_remaining_str"] = remaining
-                        upload_status["estimated_total_time"] = total_est
-                        upload_status["last_update_time"] = time.time()
-
-            # Final timing update
-            upload_status.update({
-                "in_progress": False,
-                "progress": 100,
-                "elapsed_time": format_time(time.time() - upload_status["start_time"]),
-                "time_remaining_str": "Complete",
-                "estimated_total_time": format_time(time.time() - upload_status["start_time"])
-            })
-            
-            file_size = os.path.getsize(filepath)
-
-            if db:
-                check_and_manage_storage(file_size)
-                new_evidence = EvidenceFile(filename=filename, filepath=filepath, filesize=file_size)
-                db.session.add(new_evidence)
-                db.session.commit()
-                return redirect(url_for('load_evidence', file_id=new_evidence.id, new_upload=True))
-            else:
-                is_encrypted = _load_file_into_session(filename, filepath)
-                flash(f"Successfully uploaded '{filename}' for analysis (non-persistent).", "success")
-                if is_encrypted:
-                    return redirect(url_for('decryption_page', filename=filename))
-                return redirect(url_for('forensic_analysis'))
+    """Handle evidence file upload with progress tracking."""
+    global uploaded_files_db, upload_status
     
-    # GET request - show upload form with timing information
+    if request.method == 'POST':
+        # This route should only handle AJAX uploads, but keep for fallback
+        flash('Please use the upload form with JavaScript enabled.', 'error')
+        return redirect(request.url)
+    
+    # Get database files if available
     db_files = []
     if db:
         try:
             db_files = EvidenceFile.query.order_by(EvidenceFile.upload_date.desc()).all()
         except Exception as e:
-            flash(f"Database connection error: {e}. Running in non-persistent mode.", "error")
+            print(f"Database error: {e}")
     
-    content = render_template_string(EVIDENCE_UPLOAD_CONTENT, uploaded_files=uploaded_files_db, db_files=db_files)
-    return render_template_string(BASE_TEMPLATE, content=content, uploaded_files_db=uploaded_files_db)
+    content = render_template_string(
+        EVIDENCE_UPLOAD_CONTENT,
+        uploaded_files=uploaded_files_db,
+        db_files=db_files
+    )
+    return render_template_string(BASE_TEMPLATE, content=content)
 
-@app.route('/encryption_page', methods=['GET', 'POST'])
-def encryption_page():
-    if request.method == 'POST':
-        if 'file' not in request.files or not request.form.get('password'):
-            content = render_template_string(
-                ENCRYPTION_PAGE_CONTENT, 
-                success=False, 
-                message='Error: Both a file and a password are required.'
-            )
-            return render_template_string(BASE_TEMPLATE, content=content, uploaded_files_db=uploaded_files_db)
+@app.route('/ajax_upload', methods=['POST'])
+def ajax_upload():
+    """Handle AJAX file upload with progress tracking."""
+    global uploaded_files_db, upload_status
+    
+    if 'file' not in request.files:
+        return jsonify({'error': 'No file selected'}), 400
+    
+    file = request.files['file']
+    if file.filename == '':
+        return jsonify({'error': 'No file selected'}), 400
+    
+    try:
+        filename = secure_filename(file.filename)
+        filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
 
-        file = request.files['file']
-        password = request.form['password']
+        # If database is enabled, create a DB record and mark in-progress
+        evidence_record = None
+        if db:
+            try:
+                with app.app_context():
+                    evidence_record = EvidenceFile(filename=filename, filepath=filepath, filesize=0, upload_in_progress=True)
+                    db.session.add(evidence_record)
+                    db.session.commit()
+            except Exception:
+                try:
+                    db.session.rollback()
+                except Exception:
+                    pass
+                evidence_record = None
 
-        if file.filename == '':
-            content = render_template_string(
-                ENCRYPTION_PAGE_CONTENT, 
-                success=False, 
-                message='Error: Please select a file to encrypt.'
-            )
-            return render_template_string(BASE_TEMPLATE, content=content, uploaded_files_db=uploaded_files_db)
+        # Initialize upload status
+        upload_status.update({
+            "in_progress": True,
+            "progress": 0,
+            "filename": filename,
+            "start_time": time.time(),
+            "estimated_total_time": None,
+            "elapsed_time": "0s",
+            "time_remaining_str": "Calculating...",
+            "total_bytes": 0,
+            "bytes_uploaded": 0,
+            "upload_speed": 0,
+            "last_update_time": time.time(),
+            "error": None
+        })
 
-        original_filename = secure_filename(file.filename)
-        temp_filepath = os.path.join(app.config['UPLOAD_FOLDER'], f"temp_encrypt_{original_filename}")
-        file.save(temp_filepath)
+        # Try to determine total size (may not always be available)
+        try:
+            file.stream.seek(0, os.SEEK_END)
+            total_size = file.stream.tell()
+            file.stream.seek(0)
+        except Exception:
+            # Fallback: use Content-Length header if present
+            total_size = request.content_length or 0
 
-        success, message, encrypted_filename = custom_encrypt_file(
-            temp_filepath,
-            original_filename,
-            password, 
-            app.config['ENCRYPTED_FOLDER']
+        upload_status["total_bytes"] = total_size
+
+        # Save file in chunks and update progress so polling clients see accurate values
+        chunk_size = 4 * 1024 * 1024  # 4MB
+        bytes_written = 0
+
+        # Save file in chunks and optionally persist bytes in DB chunks
+        with open(filepath, 'wb') as out_f:
+            chunk_index = 0
+            while True:
+                chunk = file.stream.read(chunk_size)
+                if not chunk:
+                    break
+                out_f.write(chunk)
+                bytes_written += len(chunk)
+
+                # Persist chunk to DB if available (best-effort)
+                if evidence_record:
+                    try:
+                        # Use app context for DB operations since upload may be handled outside the request scope
+                        with app.app_context():
+                            db_chunk = EvidenceFileChunk(evidence_id=evidence_record.id, chunk_index=chunk_index, data=chunk)
+                            db.session.add(db_chunk)
+                            # commit periodically to avoid huge transactions
+                            if chunk_index % 16 == 0:
+                                db.session.commit()
+                            chunk_index += 1
+                    except Exception:
+                        try:
+                            db.session.rollback()
+                        except Exception:
+                            pass
+
+                # Update upload status using helper
+                try:
+                    update_upload_progress(bytes_uploaded=bytes_written, total_bytes=total_size or bytes_written)
+                except Exception:
+                    # Non-fatal - continue writing
+                    upload_status['bytes_uploaded'] = bytes_written
+                    upload_status['total_bytes'] = total_size or bytes_written
+
+        # Finalize upload status
+        upload_status.update({
+            "in_progress": False,
+            "progress": 100,
+            "bytes_uploaded": bytes_written,
+            "complete": True,
+            "elapsed_time": format_time(time.time() - upload_status["start_time"]) 
+        })
+
+        # Mark DB record as complete and set filesize
+        if evidence_record:
+            try:
+                evidence_record.filesize = bytes_written
+                evidence_record.upload_in_progress = False
+                db.session.commit()
+            except Exception:
+                db.session.rollback()
+
+        # Start processing in background so response returns quickly
+        try:
+            threading.Thread(target=_process_uploaded_file, args=(filename, filepath), daemon=True).start()
+        except Exception:
+            # If background thread cannot be started, process inline (best-effort)
+            _process_uploaded_file(filename, filepath)
+
+        return jsonify({
+            'success': True,
+            'filename': filename,
+            'message': f'File "{filename}" uploaded successfully!'
+        })
+        
+    except Exception as e:
+        upload_status.update({
+            "in_progress": False,
+            "error": str(e)
+        })
+        return jsonify({'error': f'Error uploading file: {str(e)}'}), 500
+def _process_uploaded_file(filename, filepath):
+    """Process uploaded file and add to database."""
+    global uploaded_files_db
+
+    file_size = os.path.getsize(filepath)
+    encryption_info = detect_encryption(filepath)
+    forensic_results, partition_info = perform_forensic_analysis(filepath)
+
+    uploaded_files_db[filename] = {
+        "path": filepath,
+        "size_mb": f"{file_size / (1024 * 1024):.2f}",
+        "encryption_status": {
+            "encrypted": encryption_info['encrypted'],
+            "encryption_type": encryption_info['encryption_type'],
+            "description": encryption_info['description'],
+            "decrypting": False,
+            "decrypted_path": None
+        },
+        "forensic_results": forensic_results,
+        "partition_info": partition_info,
+        "hash_info": {},
+        "hashing_complete": False
+    }
+
+    # Start background hashing
+    hashing_thread = threading.Thread(target=calculate_hashes_threaded, args=(filepath,))
+    hashing_thread.daemon = True
+    hashing_thread.start()
+
+    # Add to database if available and not already present.
+    if db:
+        try:
+            with app.app_context():
+                # Check if a file with this path already exists
+                existing_file = EvidenceFile.query.filter_by(filepath=filepath).first()
+                if not existing_file:
+                    check_and_manage_storage(file_size)
+                    new_file = EvidenceFile(
+                        filename=filename,
+                        filepath=filepath,
+                        filesize=file_size
+                    )
+                    db.session.add(new_file)
+                    db.session.commit()
+        except Exception as e:
+            try:
+                db.session.rollback()
+            except Exception:
+                pass
+            print(f"Error adding file to database: {e}")
+
+        
+
+def update_upload_progress(bytes_uploaded=None, total_bytes=None):
+    """Update upload progress in real-time."""
+    global upload_status
+    
+    current_time = time.time()
+    
+    if not upload_status.get("start_time"):
+        upload_status["start_time"] = current_time
+    
+    elapsed = current_time - upload_status["start_time"]
+    upload_status["elapsed_time"] = format_time(elapsed)
+    
+    if bytes_uploaded is not None and total_bytes is not None:
+        upload_status["bytes_uploaded"] = bytes_uploaded
+        upload_status["total_bytes"] = total_bytes
+        
+        if total_bytes > 0:
+            progress = (bytes_uploaded / total_bytes) * 100
+            upload_status["progress"] = min(progress, 99)  # Cap at 99% until complete
+            
+            # Calculate upload speed
+            if elapsed > 0:
+                upload_speed = bytes_uploaded / elapsed
+                upload_status["upload_speed"] = upload_speed
+                
+                # Calculate time remaining
+                if progress > 0:
+                    estimated_total = elapsed / (progress / 100)
+                    estimated_remaining = estimated_total - elapsed
+                    upload_status["time_remaining_str"] = format_time(max(0, estimated_remaining))
+                    upload_status["estimated_total_time"] = format_time(estimated_total)
+    
+    upload_status["last_update_time"] = current_time
+    return upload_status
+
+@app.route('/encrypt_file', methods=['POST'])
+def encrypt_file():
+    """Handle file encryption request."""
+    if 'file' not in request.files:
+        flash('No file selected', 'error')
+        return redirect(url_for('encryption_page'))
+    
+    file = request.files['file']
+    if file.filename == '':
+        flash('No file selected', 'error')
+        return redirect(url_for('encryption_page'))
+    
+    password = request.form.get('password')
+    confirm_password = request.form.get('confirm_password')
+    
+    if not password or password != confirm_password:
+        flash('Passwords do not match or are empty', 'error')
+        return redirect(url_for('encryption_page'))
+    
+    if len(password) < 4:
+        flash('Password must be at least 4 characters long', 'error')
+        return redirect(url_for('encryption_page'))
+    
+    try:
+        # Save uploaded file temporarily
+        filename = secure_filename(file.filename)
+        temp_path = os.path.join(app.config['UPLOAD_FOLDER'], f"temp_{filename}")
+        file.save(temp_path)
+        
+        # Encrypt the file
+        success, message, output_filename = custom_encrypt_file(
+            temp_path, filename, password, app.config['ENCRYPTED_FOLDER']
         )
         
-        os.remove(temp_filepath)
+        # Clean up temp file
+        try:
+            os.remove(temp_path)
+        except:
+            pass
+        
+        if success:
+            # After successful encryption, redirect to the encryption page
+            # and pass the new filename as a URL parameter.
+            return redirect(url_for('encryption_page', newly_encrypted_file=output_filename))
+        else:
+            flash(f'Encryption failed: {message}', 'error')
+            
+    except Exception as e:
+        flash(f'Error during encryption: {str(e)}', 'error')
+    
+    return redirect(url_for('encryption_page'))
 
-        content = render_template_string(
-            ENCRYPTION_PAGE_CONTENT,
-            success=success,
-            message=message,
-            encrypted_filename=encrypted_filename
+
+@app.route('/download_encrypted/<filename>')
+def download_encrypted_file(filename):
+    """Download an encrypted file."""
+    try:
+        # Secure the filename to prevent directory traversal
+        safe_filename = secure_filename(filename)
+        file_path = os.path.join(app.config['ENCRYPTED_FOLDER'], safe_filename)
+        
+        # Check if file exists
+        if not os.path.exists(file_path):
+            flash(f"Encrypted file '{safe_filename}' not found.", "error")
+            return redirect(url_for('encryption_page'))
+        
+        # Send the file for download
+        return send_file(
+            file_path,
+            as_attachment=True,
+            download_name=safe_filename,
+            mimetype='application/octet-stream'
         )
-        return render_template_string(BASE_TEMPLATE, content=content, uploaded_files_db=uploaded_files_db)
+        
+    except Exception as e:
+        flash(f"Error downloading encrypted file: {str(e)}", "error")
+        return redirect(url_for('encryption_page'))
+    
+@app.route('/delete_encrypted/<filename>')
+def delete_encrypted_file(filename):
+    """Delete an encrypted file."""
+    try:
+        safe_filename = secure_filename(filename)
+        file_path = os.path.join(app.config['ENCRYPTED_FOLDER'], safe_filename)
+        
+        if os.path.exists(file_path):
+            os.remove(file_path)
+            flash(f"Encrypted file '{safe_filename}' deleted successfully.", "success")
+        else:
+            flash(f"Encrypted file '{safe_filename}' not found.", "error")
+            
+    except Exception as e:
+        flash(f"Error deleting encrypted file: {str(e)}", "error")
+    
+    return redirect(url_for('encryption_page'))
 
-    content = render_template_string(ENCRYPTION_PAGE_CONTENT)
+@app.route('/encryption_page', methods=['GET'])
+def encryption_page():
+    """Displays the encryption page, lists existing encrypted files, and shows success messages."""
+    # This route now only handles GET requests to display the page.
+    # The actual encryption is handled by the '/encrypt_file' route.
+    
+    # Get the newly encrypted filename from the URL parameter, if it exists.
+    newly_encrypted_file = request.args.get('newly_encrypted_file')
+    
+    # Get the list of all currently encrypted files to display them.
+    encrypted_files = get_encrypted_files()
+    
+    # Render the HTML template, passing the necessary variables to it.
+    content = render_template_string(
+        ENCRYPTION_PAGE_CONTENT,
+        encrypted_files=encrypted_files,
+        newly_encrypted_file=newly_encrypted_file
+    )
     return render_template_string(BASE_TEMPLATE, content=content, uploaded_files_db=uploaded_files_db)
+
+
+@app.route('/manual_carve_hex', methods=['POST'])
+def manual_carve_hex():
+    filepath = get_active_evidence_path()
+    if not filepath:
+        return jsonify({'error': 'No evidence file loaded.'}), 400
+
+    start_s = request.form.get('start_offset', '').strip()
+    length_s = request.form.get('length', '').strip()
+    try:
+        if isinstance(start_s, str) and start_s.startswith('0x'):
+            start = int(start_s, 16)
+        else:
+            start = int(start_s)
+        length = int(length_s)
+    except Exception:
+        return jsonify({'error': 'Invalid start offset or length.'}), 400
+
+    if length <= 0:
+        return jsonify({'error': 'Length must be positive.'}), 400
+
+    file_size = os.path.getsize(filepath)
+    if start < 0 or start >= file_size:
+        return jsonify({'error': 'Start offset out of range.'}), 400
+
+    # cap length to reasonable preview size to avoid huge responses
+    MAX_PREVIEW = 64 * 1024  # 64 KB
+    length = min(length, MAX_PREVIEW, file_size - start)
+
+    try:
+        with open(filepath, 'rb') as f:
+            f.seek(start)
+            data = f.read(length)
+    except Exception as e:
+        return jsonify({'error': f'Error reading file: {e}'}), 500
+
+    html = _format_hex_scrabble(data, start_offset=start)
+    return jsonify({'html': html})
 
 @app.route('/load_evidence/<int:file_id>')
 def load_evidence(file_id):
@@ -5075,13 +6900,26 @@ def load_evidence(file_id):
 
     evidence = None
     if db and file_id != -1:
-        evidence = EvidenceFile.query.get(file_id)
+        try:
+            # Use Session.get to avoid LegacyAPIWarning in SQLAlchemy 1.x/2.0
+            evidence = db.session.get(EvidenceFile, file_id)
+        except Exception:
+            # Fallback for older SQLAlchemy versions
+            try:
+                evidence = EvidenceFile.query.get(file_id)
+            except Exception:
+                evidence = None
     
     if evidence:
         filename = evidence.filename
         filepath = evidence.filepath
         is_encrypted = _load_file_into_session(filename, filepath)
-        
+
+        # If the loader returned None, the file was not found or could not be loaded
+        if is_encrypted is None:
+            flash(f"Evidence file '{filename}' could not be found on disk: {filepath}", "error")
+            return redirect(url_for('evidence_upload'))
+
         if new_upload:
             flash(f"Successfully uploaded and loaded '{filename}' for analysis.", "success")
         else:
@@ -5110,7 +6948,13 @@ def remove_from_db(file_id):
         flash("Database functionality is not enabled.", "error")
         return redirect(url_for('evidence_upload'))
 
-    evidence_to_remove = EvidenceFile.query.get(file_id)
+    try:
+        evidence_to_remove = db.session.get(EvidenceFile, file_id)
+    except Exception:
+        try:
+            evidence_to_remove = EvidenceFile.query.get(file_id)
+        except Exception:
+            evidence_to_remove = None
 
     if evidence_to_remove:
         try:
@@ -5131,6 +6975,53 @@ def remove_from_db(file_id):
         flash("File not found in the database.", "error")
     
     return redirect(url_for('evidence_upload'))
+
+
+@app.route('/ajax_upload_abort', methods=['POST'])
+def ajax_upload_abort():
+    """Abort an in-progress upload and remove partial data (disk + DB chunks)."""
+    try:
+        payload = request.get_json() or {}
+        filename = payload.get('filename')
+        if not filename:
+            return jsonify({'error': 'No filename provided'}), 400
+
+        filepath = os.path.join(app.config['UPLOAD_FOLDER'], secure_filename(filename))
+
+        # Remove partial disk file if present
+        try:
+            if os.path.exists(filepath):
+                os.remove(filepath)
+        except Exception:
+            pass
+
+        # Remove DB record and chunks if available
+        if db:
+            try:
+                evidence = EvidenceFile.query.filter_by(filename=filename).first()
+                if evidence:
+                    db.session.delete(evidence)
+                    db.session.commit()
+            except Exception:
+                db.session.rollback()
+
+        # Reset upload_status if it refers to this file
+        try:
+            if upload_status.get('filename') == filename:
+                upload_status.update({
+                    'in_progress': False,
+                    'progress': 0,
+                    'bytes_uploaded': 0,
+                    'total_bytes': 0,
+                    'filename': None,
+                    'error': 'Aborted by client due to size threshold'
+                })
+        except Exception:
+            pass
+
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/decryption/<filename>', methods=['GET', 'POST'])
 def decryption_page(filename):
@@ -5289,16 +7180,86 @@ def recovered_files():
                                      total_pages=total_pages)
     return render_template_string(BASE_TEMPLATE, content=content, uploaded_files_db=uploaded_files_db)
 
-# (The rest of your routes from manual_carving onwards remain the same...)
-# ... PASTE THE REST OF YOUR ROUTES HERE, STARTING FROM @app.route('/manual_carving') ...
-
 @app.route('/manual_carving')
 def manual_carving():
     if not uploaded_files_db:
         flash("Please upload an evidence file first to use the manual carver.", "error")
         return redirect(url_for('evidence_upload'))
     content = render_template_string(MANUAL_CARVING_CONTENT)
+    # append the evidence hex viewer box at the end
+    content = content + render_template_string(MANUAL_CARVING_EVIDENCE_HEX)
     return render_template_string(BASE_TEMPLATE, content=content, uploaded_files_db=uploaded_files_db)
+
+
+def _format_hex_scrabble(data_bytes, start_offset=0, bytes_per_line=16, group_size=4):
+    """Return HTML string with hex displayed in grouped 'scrabble' format.
+
+    Each line: offset | grouped hex (uppercase) | ASCII printable on right
+    """
+    lines = []
+    for i in range(0, len(data_bytes), bytes_per_line):
+        chunk = data_bytes[i:i+bytes_per_line]
+        offset = start_offset + i
+        hex_bytes = [f"{b:02X}" for b in chunk]
+        # group into group_size
+        grouped = []
+        for j in range(0, len(hex_bytes), group_size):
+            grouped.append(' '.join(hex_bytes[j:j+group_size]))
+        hex_part = '  '.join(grouped)
+        
+        ascii_part = ''.join([chr(b) if 32 <= b < 127 else '.' for b in chunk])
+        lines.append(f"<div><span class=\"font-mono\" style=\"color:#9CA3AF; width:120px; display:inline-block;\">0x{offset:08X}</span> <span class=\"font-mono\" style=\"color:#d1d5db;\">{hex_part}</span> <span class=\"font-mono\" style=\"color:#9CA3AF; margin-left:12px;\">{ascii_part}</span></div>")
+    return '<div class="hex-view p-3" style="background:#0b0f14;">' + '\n'.join(lines) + '</div>'
+
+@app.route('/view_evidence_hex', methods=['POST'])
+def view_evidence_hex():
+    """Handles requests for hex data from the evidence file viewer."""
+    filepath = get_active_evidence_path()
+    if not filepath:
+        return jsonify({'error': 'No evidence file loaded. Please upload a file first.'}), 400
+
+    try:
+        file_size = os.path.getsize(filepath)
+    except OSError as e:
+        return jsonify({'error': f'Cannot access evidence file: {e}'}), 500
+    
+    if file_size == 0:
+        return jsonify({'error': 'The loaded evidence file is empty (0 bytes).'}), 400
+
+    start_s = request.form.get('start_offset', '0').strip()
+    length_s = request.form.get('length', '65536').strip()
+    
+    try:
+        # Handle both decimal and hexadecimal (0x) inputs for the start offset
+        start = int(start_s, 16) if start_s.lower().startswith('0x') else int(start_s)
+        length = int(length_s)
+    except (ValueError, TypeError):
+        return jsonify({'error': 'Invalid start offset or length. Please enter valid numbers.'}), 400
+
+    if start < 0 or start >= file_size:
+        return jsonify({'error': f'Start offset is out of range. File size is {file_size} bytes.'}), 400
+
+    MAX_PREVIEW = 128 * 1024  # 128KB maximum to prevent browser overload
+    
+    # Calculate the actual number of bytes to read, ensuring it doesn't exceed limits
+    bytes_to_read = min(length, MAX_PREVIEW, file_size - start)
+
+    # If there are no bytes to read (e.g., at the end of the file), return a clear message
+    if bytes_to_read <= 0:
+         html = '<div class="p-4 text-gray-500">End of file reached.</div>'
+         return jsonify({'html': html, 'start': start, 'length': 0, 'file_size': file_size})
+
+    try:
+        with open(filepath, 'rb') as f:
+            f.seek(start)
+            data = f.read(bytes_to_read)
+    except Exception as e:
+        return jsonify({'error': f'Error reading file: {e}'}), 500
+
+    # Format the data into the scrabble hex view and return it
+    html = _format_hex_scrabble(data, start_offset=start)
+    return jsonify({'html': html, 'start': start, 'length': len(data), 'file_size': file_size})
+
 
 @app.route('/log_file_viewer', methods=['GET', 'POST'])
 def log_file_viewer():
@@ -5411,14 +7372,66 @@ def reporting():
         except: 
             report_deleted_files = {}
 
+        # Read report-scope options from the form
+        include_carved = bool(request.form.get('include_carved'))
+        include_deleted = bool(request.form.get('include_deleted'))
+        selected_categories = request.form.getlist('file_category') or []
+        custom_exts_raw = (request.form.get('custom_exts') or '').strip()
+        custom_exts = [e.lower().strip().lstrip('.') for e in custom_exts_raw.split(',') if e.strip()] if custom_exts_raw else []
+
+        # Helper: determine category by extension
+        def ext_category(ext_no_dot):
+            e = ext_no_dot.lower()
+            if e in ['jpg','jpeg','png','gif','bmp','tiff','webp']:
+                return 'images'
+            if e in ['doc','docx','pdf','xls','xlsx','ppt','pptx','txt','rtf']:
+                return 'documents'
+            if e in ['zip','rar','7z','tar','gz','bz2','tgz','xz']:
+                return 'archives'
+            if e in ['mp3','wav','flac','mp4','mov','avi','mkv','wmv']:
+                return 'media'
+            if e in ['exe','dll','elf','bin','sys','apk']:
+                return 'executables'
+            return 'other'
+
+        # Apply filters to carved and deleted maps
+        def filter_map(src_map):
+            if not src_map:
+                return {}
+            if not selected_categories and not custom_exts:
+                return src_map
+            out = {}
+            for fname, info in src_map.items():
+                # try to get extension
+                ext = ''
+                if '.' in fname:
+                    ext = fname.rsplit('.',1)[1].lower()
+                cat = ext_category(ext) if ext else 'other'
+                if custom_exts and ext and ext in custom_exts:
+                    out[fname] = info
+                    continue
+                if selected_categories and cat in selected_categories:
+                    out[fname] = info
+            return out
+
+        # Filter according to include_* flags
+        if include_carved:
+            carved_filtered = filter_map(report_carved_files)
+        else:
+            carved_filtered = {}
+        if include_deleted:
+            deleted_filtered = filter_map(report_deleted_files)
+        else:
+            deleted_filtered = {}
+
         if report_format == 'html':
-            for filename, info in report_carved_files.items():
+            for filename, info in carved_filtered.items():
                 filepath = os.path.join(app.config['CARVED_FOLDER'], filename)
                 info['thumbnail_uri'] = create_thumbnail_data_uri(filepath)
             
             report_html = render_template_string(
                 REPORT_TEMPLATE, case_details=case_details, evidence_file=uploaded_files_db,
-                carved_files=report_carved_files, deleted_files=report_deleted_files, now=now
+                carved_files=carved_filtered, deleted_files=deleted_filtered, now=now
             )
             response = make_response(report_html)
             response.headers['Content-Disposition'] = f"attachment; filename=Report_{safe_case_name}.html"
@@ -5428,14 +7441,14 @@ def reporting():
             if not HTML:
                 flash("PDF generation requires the 'weasyprint' library. Please run: pip install weasyprint", "error")
                 return redirect(url_for('reporting'))
-            
-            for filename, info in report_carved_files.items():
+
+            for filename, info in carved_filtered.items():
                 filepath = os.path.join(app.config['CARVED_FOLDER'], filename)
                 info['thumbnail_uri'] = create_thumbnail_data_uri(filepath)
 
             report_html = render_template_string(
                 REPORT_TEMPLATE, case_details=case_details, evidence_file=uploaded_files_db,
-                carved_files=report_carved_files, deleted_files=report_deleted_files, now=now
+                carved_files=carved_filtered, deleted_files=deleted_filtered, now=now
             )
             pdf_bytes = HTML(string=report_html).write_pdf()
             response = make_response(pdf_bytes)
@@ -5444,14 +7457,14 @@ def reporting():
             return response
             
         elif report_format == 'docx':
-            docx_buffer = generate_docx_report_data(case_details, uploaded_files_db, report_carved_files, report_deleted_files, now)
+            docx_buffer = generate_docx_report_data(case_details, uploaded_files_db, carved_filtered, deleted_filtered, now)
             if not docx_buffer:
                 flash("DOCX generation requires the 'python-docx' library. Please run: pip install python-docx", "error")
                 return redirect(url_for('reporting'))
             return send_file(docx_buffer, download_name=f'Report_{safe_case_name}.docx', as_attachment=True)
             
         elif report_format == 'csv':
-            zip_buffer = generate_csv_zip_report_data(case_details, uploaded_files_db, report_carved_files, report_deleted_files)
+            zip_buffer = generate_csv_zip_report_data(case_details, uploaded_files_db, carved_filtered, deleted_filtered)
             return send_file(zip_buffer, download_name=f'Report_{safe_case_name}_CSV.zip', as_attachment=True, mimetype='application/zip')
 
     content = render_template_string(REPORTING_PAGE_CONTENT, now=datetime.datetime.now())
@@ -5460,9 +7473,8 @@ def reporting():
 @app.route('/deleted_files_status_page')
 def deleted_files_status_page():
     """Enhanced deleted files recovery status page with multiple scanning methods."""
-    if not uploaded_files_db:
-        flash("Please upload an evidence file first.", "warning")
-        return redirect(url_for('evidence_upload'))
+    # Allow viewing recovered files even if no evidence file is currently uploaded
+    # (helps inspecting previous runs or imported recovered files).
     
     # Ensure scan_methods exists in deleted_scan_status
     if 'scan_methods' not in deleted_scan_status:
@@ -5501,6 +7513,38 @@ def deleted_files_status_page():
                                     recovered_files=recovered_files)
     return render_template_string(BASE_TEMPLATE, content=content, uploaded_files_db=uploaded_files_db)
 
+@app.route('/get_recovered_files_list')
+def get_recovered_files_list():
+    """API endpoint to get the current list of recovered files for real-time updates."""
+    try:
+        # Ensure the in-memory DB is synced with disk
+        populate_deleted_files_db_from_disk()
+        
+        # Convert the deleted_files_db to a format suitable for JSON
+        files_list = {}
+        for filename, file_info in deleted_files_db.items():
+            files_list[filename] = {
+                'name': file_info.get('name', filename),
+                'size': file_info.get('size', 0),
+                'size_kb': file_info.get('size_kb', '0'),
+                'mtime': file_info.get('mtime', 'Unknown'),
+                'file_type': file_info.get('file_type', 'Unknown'),
+                'recovery_method': file_info.get('recovery_method', 'Unknown'),
+                'thumbnail': file_info.get('thumbnail')
+            }
+        
+        return jsonify({
+            'success': True,
+            'files': files_list,
+            'total_files': len(files_list)
+        })
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e),
+            'files': {},
+            'total_files': 0
+        })
 
 
 @app.route('/decryption_status')
@@ -5522,14 +7566,93 @@ def deleted_files():
 
 @app.route('/deleted_scan_status')
 def deleted_scan_status_endpoint():
+    # Ensure timing is updated before returning
+    try:
+        # Provide a simple update based on files_found and total scanned where possible
+        total_scanned = deleted_scan_status.get('validation_stats', {}).get('total_scanned', 0)
+        # Use calculate_time_estimations helper to keep values consistent
+        calculate_time_estimations(deleted_scan_status, total_scanned)
+    except Exception:
+        # If anything goes wrong, fall back to existing fields
+        pass
+
     return jsonify({
         "in_progress": deleted_scan_status["in_progress"],
         "complete": deleted_scan_status["complete"], 
         "files_found": deleted_scan_status["files_found"],
         "message": deleted_scan_status["message"],
         "scan_methods": deleted_scan_status.get("scan_methods", {}),
-        "files": deleted_files_db
+        "files": deleted_files_db,
+        "validation_stats": deleted_scan_status.get('validation_stats', {}),
+        "elapsed_time": deleted_scan_status.get('elapsed_time', '0s'),
+        "time_remaining_str": deleted_scan_status.get('time_remaining_str', 'Calculating...'),
+        "estimated_total_time": deleted_scan_status.get('estimated_total_time', None),
+        "start_time": deleted_scan_status.get('start_time', None),
+        "last_update_time": deleted_scan_status.get('last_update_time', None)
     })
+
+@app.route('/audit_deleted_files')
+def audit_deleted_files():
+    """Audit endpoint: compare files on disk vs in-memory `deleted_files_db` and return a diff.
+
+    Returns JSON with:
+      - files_on_disk: list of filenames found in recovery folder
+      - files_in_db: list of filenames in deleted_files_db
+      - missing_in_db: files present on disk but missing in deleted_files_db
+      - missing_on_disk: files present in deleted_files_db but missing on disk
+      - summary counts
+    """
+    recovery_dir = app.config.get('DELETED_RECOVERY_FOLDER', os.path.join(APP_ROOT, 'deleted_files'))
+    try:
+        disk_list = [f for f in os.listdir(recovery_dir) if os.path.isfile(os.path.join(recovery_dir, f))]
+    except Exception:
+        disk_list = []
+
+    db_list = list(deleted_files_db.keys()) if isinstance(deleted_files_db, dict) else []
+
+    disk_set = set(disk_list)
+    db_set = set(db_list)
+
+    missing_in_db = sorted(list(disk_set - db_set))
+    missing_on_disk = sorted(list(db_set - disk_set))
+
+    # Prepare small metadata previews for the first N items in each category
+    def preview_disk(fname):
+        p = os.path.join(recovery_dir, fname)
+        meta = {}
+        try:
+            meta['size_bytes'] = os.path.getsize(p)
+            meta['mtime'] = datetime.datetime.fromtimestamp(os.path.getmtime(p)).strftime('%Y-%m-%d %H:%M:%S')
+            meta['mime'] = magic.from_file(p, mime=True)
+        except Exception:
+            meta = {'size_bytes': None, 'mtime': None, 'mime': None}
+        return meta
+
+    def preview_db(fname):
+        entry = deleted_files_db.get(fname, {})
+        return {
+            'size': entry.get('size'),
+            'size_kb': entry.get('size_kb'),
+            'file_type': entry.get('file_type'),
+            'mtime': entry.get('mtime'),
+            'path': entry.get('path')
+        }
+
+    MAX_PREVIEW = 20
+    payload = {
+        'files_on_disk': disk_list,
+        'files_in_db': db_list,
+        'missing_in_db': [{ 'name': n, 'meta': preview_disk(n) } for n in missing_in_db[:MAX_PREVIEW]],
+        'missing_on_disk': [{ 'name': n, 'meta': preview_db(n) } for n in missing_on_disk[:MAX_PREVIEW]],
+        'counts': {
+            'disk_total': len(disk_list),
+            'db_total': len(db_list),
+            'missing_in_db': len(missing_in_db),
+            'missing_on_disk': len(missing_on_disk)
+        }
+    }
+
+    return jsonify(payload)
 
 @app.route('/hex_view_carved/<filename>')
 def hex_view_carved(filename):
@@ -5742,7 +7865,7 @@ def run_auto_carving():
     """
     Handles the file carving process based on user-selected file types.
     """
-    # global carving_status, carved_files_db, sorted_carved_keys
+    global carving_status, carved_files_db, sorted_carved_keys
 
     image_path = get_active_evidence_path()
     if not image_path:
@@ -5796,7 +7919,7 @@ def clear_session():
 
 @app.route('/perform_manual_carve', methods=['POST'])
 def perform_manual_carve():
-    # global sorted_carved_keys
+    global sorted_carved_keys
     filepath = get_active_evidence_path()
     if not filepath:
         flash("No evidence file is loaded.", "error")
@@ -5835,6 +7958,115 @@ def perform_manual_carve():
 
     flash(f"Successfully carved {len(data_to_carve)} bytes to '{carved_filename}'.", "success")
     return redirect(url_for('recovered_files'))
+
+@app.route('/diag')
+def diag():
+    """Diagnostic endpoint for server environment and CDN reachability.
+    Returns JSON with Python/platform info, quick checks of external CDNs used by the templates,
+    and a tail of any wsgi import error log we created earlier.
+    """
+    import platform
+    import urllib.request
+    
+    def _check_url(url, timeout=5):
+        try:
+            with urllib.request.urlopen(url, timeout=timeout) as resp:
+                return {"ok": True, "status": getattr(resp, 'status', None)}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    result = {
+        "python_version": platform.python_version(),
+        "platform": platform.platform(),
+        "project_root": APP_ROOT,
+        "cdn_tailwind": _check_url('https://cdn.tailwindcss.com'),
+        "font_inter": _check_url('https://rsms.me/inter/inter.css'),
+    }
+
+    # wsgi import errors tail (if present)
+    wsgi_log = os.path.join(APP_ROOT, 'wsgi_import_errors.log')
+    if os.path.exists(wsgi_log):
+        try:
+            with open(wsgi_log, 'r', encoding='utf-8', errors='ignore') as lf:
+                data = lf.read()
+                result['wsgi_import_errors_tail'] = data[-4000:]
+        except Exception as e:
+            result['wsgi_import_errors_tail'] = f"error reading file: {e}"
+    else:
+        result['wsgi_import_errors_tail'] = None
+
+    # carved/deleted folder counts
+    try:
+        result['carved_files_count'] = len(os.listdir(CARVED_FOLDER)) if os.path.exists(CARVED_FOLDER) else None
+    except Exception as e:
+        result['carved_files_count'] = f"error: {e}"
+    try:
+        result['deleted_files_count'] = len(os.listdir(DELETED_RECOVERY_FOLDER)) if os.path.exists(DELETED_RECOVERY_FOLDER) else None
+    except Exception as e:
+        result['deleted_files_count'] = f"error: {e}"
+
+    return jsonify(result)
+
+@app.route('/database_view')
+def database_view():
+    """Displays files from the database and recovered files from disk."""
+    db_files = []
+    if db:
+        try:
+            db_files = EvidenceFile.query.order_by(EvidenceFile.upload_date.desc()).all()
+        except Exception as e:
+            flash(f"Could not connect to database: {e}", "error")
+
+    def get_files_from_dir(directory):
+        file_list = []
+        try:
+            for filename in os.listdir(directory):
+                filepath = os.path.join(directory, filename)
+                if os.path.isfile(filepath):
+                    size = os.path.getsize(filepath)
+                    file_list.append({'name': filename, 'size': format_bytes(size)})
+        except Exception:
+            pass
+        return sorted(file_list, key=lambda x: x['name'])
+
+    carved_disk_files = get_files_from_dir(app.config['CARVED_FOLDER'])
+    deleted_disk_files = get_files_from_dir(app.config['DELETED_RECOVERY_FOLDER'])
+
+    content = render_template_string(
+        DATABASE_VIEW_CONTENT,
+        db_files=db_files,
+        carved_disk_files=carved_disk_files,
+        deleted_disk_files=deleted_disk_files,
+        carved_folder_path=app.config['CARVED_FOLDER'],
+        deleted_folder_path=app.config['DELETED_RECOVERY_FOLDER']
+    )
+    return render_template_string(BASE_TEMPLATE, content=content, uploaded_files_db=uploaded_files_db)
+
+@app.route('/delete_disk_file/<string:folder>/<path:filename>')
+def delete_disk_file(folder, filename):
+    """Deletes a single file from a specified recovery folder."""
+    s_filename = secure_filename(filename)
+    
+    if folder == 'carved':
+        target_dir = app.config['CARVED_FOLDER']
+    elif folder == 'deleted_recovered':
+        target_dir = app.config['DELETED_RECOVERY_FOLDER']
+    else:
+        flash("Invalid folder specified.", "error")
+        return redirect(url_for('database_view'))
+
+    filepath = os.path.join(target_dir, s_filename)
+
+    try:
+        if os.path.exists(filepath) and os.path.isfile(filepath):
+            os.remove(filepath)
+            flash(f"Successfully deleted '{s_filename}' from disk.", "success")
+        else:
+            flash(f"File '{s_filename}' not found.", "error")
+    except Exception as e:
+        flash(f"Error deleting file: {e}", "error")
+
+    return redirect(url_for('database_view'))
 
 if __name__ == '__main__':
     app.run(debug=True)
