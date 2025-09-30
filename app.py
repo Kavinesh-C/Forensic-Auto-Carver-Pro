@@ -7919,7 +7919,7 @@ def clear_session():
 
 @app.route('/perform_manual_carve', methods=['POST'])
 def perform_manual_carve():
-    # global sorted_carved_keys
+    #global sorted_carved_keys
     filepath = get_active_evidence_path()
     if not filepath:
         flash("No evidence file is loaded.", "error")
