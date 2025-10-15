@@ -1,9 +1,9 @@
 # Core application libraries
 Flask==2.3.3
 Pillow==10.4.0
-pytsk3==2023.9.1
+pytsk3>=20231007,<20260000
 cryptography==41.0.3
-python-magic==0.4.28
+python-magic==0.4.27
 Flask-SQLAlchemy==3.0.3
 SQLAlchemy==2.0.21
 psycopg2-binary==2.9.10
