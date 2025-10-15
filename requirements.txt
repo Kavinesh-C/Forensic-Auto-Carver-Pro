@@ -1,0 +1,32 @@
+# Core application libraries
+Flask==2.3.3
+Pillow==10.4.0
+pytsk3==2023.9.1
+cryptography==41.0.3
+python-magic==0.4.28
+Flask-SQLAlchemy==3.0.3
+SQLAlchemy==2.0.21
+psycopg2-binary==2.9.10
+pymysql==1.0.3
+mysqlclient==2.1.1
+pymongo==4.4.0
+redis==4.6.0
+keyring==24.1.0
+flask-login==0.7.0
+Flask-WTF==1.1.1
+passlib==1.7.4
+rq==1.13.0
+
+# Optional libraries for specific features (recommended for full functionality)
+weasyprint==57.1   # For PDF reporting (pin a known-good version)
+python-docx==0.8.11   # For DOCX reporting
+python-evtx==1.11.1   # For Windows Event Log (.evtx) parsing
+
+# Optional testing / headless UI capture tools
+# Playwright is optional; to install run:
+#   py -3 -m pip install playwright
+#   py -3 -m playwright install
+# The script tests/db_ui_screenshot.py will exit early with an instruction
+# if Playwright is not available in the running interpreter.
+playwright
+pytest

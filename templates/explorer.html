@@ -1,0 +1,77 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Explorer</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <link rel="stylesheet" href="/static/css/explorer.css">
+</head>
+<body class="bg-gray-900 text-gray-200">
+<div id="fac-explorer" class="p-4" data-csrf="{{ csrf_token|tojson }}" data-pyewf-available="{{ pyewf_available|tojson }}">
+  <div class="flex items-center justify-between mb-2">
+    <div class="flex gap-2 items-center">
+      <button id="btn-back" class="btn-secondary">◀</button>
+      <button id="btn-forward" class="btn-secondary">▶</button>
+      <button id="btn-up" class="btn-secondary">⬆</button>
+      <button id="btn-refresh" class="btn-secondary">⟳</button>
+      <input id="address" type="text" class="bg-gray-800 border border-gray-600 text-white p-2 rounded w-96 ml-2" placeholder="Root / path" />
+    </div>
+    <div class="flex gap-2 items-center">
+      <select id="root-select" class="bg-gray-800 border p-2 rounded">
+        <option value="">Select root...</option>
+        {% for r in allowed_roots %}
+        <option value="{{ r }}" {% if root_display==r %}selected{% endif %}>{{ r }}</option>
+        {% endfor %}
+      </select>
+      <button id="btn-new-folder" class="btn-primary">New Folder</button>
+      <label class="btn-secondary px-2 py-1 rounded cursor-pointer"><input id="file-input" type="file" style="display:none"> Upload</label>
+      <button id="btn-zip" class="btn-secondary">Download Folder (ZIP)</button>
+    </div>
+  </div>
+
+  <div class="flex gap-4">
+    <div class="w-64 bg-gray-800 p-2 rounded">
+      <div class="mb-2 font-semibold">Quick access</div>
+      <div id="quick-list" class="flex flex-col gap-1 text-sm">
+        <a href="#" class="quick-item" data-root="Upload Files">Upload Files</a>
+        <a href="#" class="quick-item" data-root="Session Files">Session Files</a>
+      </div>
+      <div class="mt-4">
+        <div class="font-semibold">Favorites</div>
+        <div id="favorites" class="flex flex-col gap-1"></div>
+      </div>
+      <div class="mt-4">
+        <div class="font-semibold">Session Management</div>
+        <div class="flex flex-col gap-1 mt-2">
+          <button id="btn-create-image" class="btn-primary">Create Image</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="flex-1 bg-gray-800 p-3 rounded" id="explorer-container">
+      <div class="flex items-center justify-between mb-2">
+        <div class="flex items-center gap-2">
+          <label><input type="checkbox" id="select-all"> Select all</label>
+          <button id="btn-bulk-delete" class="btn-danger">Delete selected</button>
+          <select id="bulk-status-select" class="bg-gray-700 text-white p-1 rounded">
+            <option value="">Apply status...</option>
+            <option value="saved">saved</option>
+            <option value="processing">processing</option>
+            <option value="waiting">waiting</option>
+            <option value="paused">paused</option>
+          </select>
+          <button id="bulk-status-apply" class="btn-secondary">Apply</button>
+        </div>
+        <div class="text-sm text-gray-400" id="status-bar">Items: 0</div>
+      </div>
+
+      <div id="explorer-list" class="bg-gray-900 p-2 rounded min-h-[300px]">
+        <!-- Populated by JS -->
+      </div>
+    </div>
+  </div>
+</div>
+
+<script src="/static/js/explorer.js"></script>
+</body>
+</html>

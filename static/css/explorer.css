@@ -1,0 +1,85 @@
+/* Minimal explorer CSS – keep styles simple and dark-themed */
+body { font-family: Segoe UI, Tahoma, Geneva, Verdana, sans-serif; background:#071018; color:#e6eef6; }
+#fac-explorer { max-width:1200px; margin:10px auto; }
+.btn-secondary, .btn-primary, .btn-danger { background:#0b1220; color:#cfe3ff; border:1px solid #2a3b4a; padding:6px 8px; border-radius:4px; cursor:pointer; }
+.btn-primary { background:#0f3b6b; }
+.btn-danger { background:#4a1b1b; }
+input[type=text], select { background:#08121a; color:#e6eef6; border:1px solid #2a3b4a; }
+#explorer-list .row { display:flex; align-items:center; gap:8px; padding:6px; border-bottom:1px solid #1b2b36; }
+#explorer-list .row:hover { background:#0d2230; }
+#explorer-list .icon { width:36px; text-align:center; }
+.ctx-menu { min-width:140px; box-shadow:0 4px 16px rgba(0,0,0,0.6); }
+.ctx-item { padding:6px 10px; border-bottom:1px solid #0f1b24; }
+.ctx-item:hover { background:#0e2a3b; }
+#preview-modal { box-shadow:0 8px 32px rgba(0,0,0,0.7); }
+.fav-item { display:block; padding:4px 6px; color:#cfe3ff; text-decoration:none; }
+.fav-item:hover { background:#0e2a3b; }
+.row .actions button { margin-left:6px; }
+.min-h-\[300px\] { min-height:300px; }
+
+/* Styled tooltip for filenames (replaces title) */
+.fac-tooltip { position: relative; display: inline-block; }
+.fac-tooltip .fac-tooltip-text { visibility: hidden; opacity: 0; transform: translateY(6px); background: rgba(15,23,42,0.95); color: #e6eef8; padding: 6px 8px; border-radius: 6px; font-size: 12px; position: absolute; z-index: 9999; left: 8px; top: 100%; white-space: nowrap; box-shadow: 0 6px 18px rgba(2,6,23,0.6); transition: opacity 0.12s ease, transform 0.12s ease; }
+.fac-tooltip:hover .fac-tooltip-text, .fac-tooltip.fac-show .fac-tooltip-text { visibility: visible; opacity: 1; transform: translateY(0); }
+
+/* Inline full-name popup */
+.fac-inline-fullname { position: absolute; z-index: 10000; background: #0b1220; color:#fff; padding:6px 8px; border:1px solid #253042; border-radius:6px; box-shadow:0 6px 20px rgba(0,0,0,0.6); max-width: 60vw; word-break: break-all; }
+
+/* Truncation vs wrap helper classes */
+.fac-wrap .row .name { white-space: normal; }
+.fac-truncate .row .name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+/* Column-resize handle (simple CSS grab area) */
+.col-resize-handle { width: 8px; cursor: col-resize; display:inline-block; vertical-align:middle; }
+.col-resize { display:flex; align-items:center; }
+
+/* Selected row styling for keyboard nav */
+.row.selected { background: rgba(99,102,241,0.06); outline: 1px solid rgba(99,102,241,0.14); }
+
+/* Pinned DB files scrollable container */
+.pinned-db-list {
+	max-height: 240px;
+	overflow-y: auto;
+	padding-right: 8px; /* give room for scrollbar */
+}
+
+.pinned-db-list .db-file-row {
+	padding-right: 6px;
+}
+
+/* Small action buttons inside pinned lists */
+.btn-small {
+	padding: 4px 8px;
+	font-size: 12px;
+	line-height: 1;
+	border-radius: 4px;
+	display: inline-block;
+	margin-left: 6px;
+}
+
+.btn-small.btn-load-db {
+	background: #0ea5e9; /* sky-500 */
+	color: white;
+	border: 1px solid rgba(14,165,233,0.9);
+}
+
+.btn-small.btn-delete {
+	background: #ef4444; /* red-500 */
+	color: white;
+	border: 1px solid rgba(239,68,68,0.9);
+}
+
+/* Toast notifications */
+.fac-toast-container { position: fixed; right: 20px; bottom: 20px; z-index: 11000; display:flex; flex-direction:column; gap:8px; }
+.fac-toast { background: rgba(12,18,26,0.95); color: #e6eef6; padding: 10px 14px; border-radius:8px; box-shadow:0 8px 32px rgba(0,0,0,0.6); border:1px solid #223246; font-size:13px; min-width:200px; }
+.fac-toast.success { border-left: 4px solid #10b981; }
+.fac-toast.info { border-left: 4px solid #0ea5e9; }
+.fac-toast.hide { opacity: 0; transform: translateY(8px); transition: opacity 220ms ease, transform 220ms ease; }
+.fac-toast.show { opacity: 1; transform: translateY(0); transition: opacity 220ms ease, transform 220ms ease; }
+
+/* Floating refresh card shown after upload to prompt user to refresh evidence list */
+.fac-refresh-card { position: fixed; left: 20px; bottom: 20px; z-index: 12000; background: #071018; color: #e6eef6; border: 1px solid #223246; box-shadow: 0 10px 30px rgba(0,0,0,0.6); padding: 12px 14px; border-radius: 10px; min-width: 260px; display:flex; align-items:center; gap:12px; }
+.fac-refresh-card .msg { flex:1; font-size:13px; }
+.fac-refresh-card .actions { display:flex; gap:8px; }
+.fac-refresh-card .btn-refresh { background:#0ea5e9; color:#072033; border: none; padding:6px 10px; border-radius:6px; cursor:pointer; }
+.fac-refresh-card .btn-dismiss { background:transparent; color:#cfe3ff; border:1px solid rgba(47,65,85,0.5); padding:6px 10px; border-radius:6px; cursor:pointer; }
