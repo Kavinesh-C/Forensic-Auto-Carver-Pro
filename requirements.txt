@@ -19,7 +19,7 @@ rq==1.13.0
 # Optional libraries for specific features (recommended for full functionality)
 weasyprint==57.1   # For PDF reporting (pin a known-good version)
 python-docx==0.8.11   # For DOCX reporting
-python-evtx==1.11.1   # For Windows Event Log (.evtx) parsing
+python-evtx==0.8.1   # For Windows Event Log (.evtx) parsing
 
 # Optional testing / headless UI capture tools
 # Playwright is optional; to install run:
